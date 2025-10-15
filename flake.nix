@@ -40,6 +40,7 @@
           pkg-config
 
           qt6.qtbase # qtpaths
+          qt6.qtdeclarative # qmlimportscanner
 
           llvmPackages.llvm # macOS llvm-otool and llvm-install-name-tool
           patchelf          # Linux RUNPATH updates
@@ -57,6 +58,10 @@
               # Host Qt search paths for plugins and QML (used by Qt tools and for runtime testing)
               export QT_PLUGIN_PATH=${pkgs.qt6.qtbase}/lib/qt-6/plugins
               export QML2_IMPORT_PATH=${pkgs.qt6.qtdeclarative}/lib/qt-6/qml
+              # Ensure qmlimportscanner is on PATH (Qt6 installs it under libexec)
+              export PATH="${pkgs.qt6.qtdeclarative}/libexec:$PATH"
+              # Hint for our tool if multiple Qt versions are present
+              export QTPATHS_BIN=${pkgs.qt6.qtbase}/bin/qtpaths
 
               # Make Windows (MinGW) Qt DLLs discoverable for PE dependency scanning
               export MINGW_QT_BIN=${mingw.qt6.qtbase}/bin:${mingw.qt6.qtdeclarative}/bin
@@ -71,6 +76,8 @@ ${mingw.double-conversion}/bin:\
 ${mingw.libpng}/bin:\
 ${mingw.openssl}/bin"
               export PATH="$MINGW_QT_BIN:$MINGW_RUNTIME_LIBS:$MINGW_EXTRA_DLLS:$PATH"
+              # Provide plugin roots for MinGW (both legacy and Qt6 layout)
+              export MINGW_QT_PLUGINS=${mingw.qt6.qtbase}/plugins:${mingw.qt6.qtdeclarative}/plugins:${mingw.qt6.qtbase}/lib/qt-6/plugins:${mingw.qt6.qtdeclarative}/lib/qt-6/plugins
 
               echo "cmake -S . -B build"
               echo "cmake --build build -j"

@@ -26,10 +26,15 @@ enum class BinaryType {
 struct Args {
     fs::path binaryPath;
     fs::path outDir;
+    std::vector<fs::path> qmlRoots;
+    std::vector<std::string> languages;
 };
 
+// Forward declaration for helper used in parseArgs
+static std::vector<std::string> splitPaths(const std::string& s, char sep);
+
 static void printUsage(const char* argv0) {
-    std::cerr << "Usage: " << argv0 << " --bin <path-to-binary> --out <output-dir>\n";
+    std::cerr << "Usage: " << argv0 << " --bin <path-to-binary> --out <output-dir> [--qml-root <dir>]... [--languages <lang[,lang...>]>\n";
 }
 
 static std::optional<Args> parseArgs(int argc, char** argv) {
@@ -40,6 +45,13 @@ static std::optional<Args> parseArgs(int argc, char** argv) {
             args.binaryPath = fs::path(argv[++i]);
         } else if (a == "--out" && i + 1 < argc) {
             args.outDir = fs::path(argv[++i]);
+        } else if (a == "--qml-root" && i + 1 < argc) {
+            args.qmlRoots.emplace_back(argv[++i]);
+        } else if (a == "--languages" && i + 1 < argc) {
+            std::string langs(argv[++i]);
+            for (const auto& item : splitPaths(langs, ',')) {
+                if (!item.empty()) args.languages.push_back(item);
+            }
         } else if (a == "-h" || a == "--help") {
             printUsage(argv[0]);
             return std::nullopt;
@@ -154,6 +166,8 @@ struct DeployPlan {
     BinaryType type;
     fs::path binaryPath;
     fs::path outputRoot;
+    std::vector<fs::path> qmlRoots; // optional CLI-provided QML roots
+    std::vector<std::string> languages; // optional languages
 };
 
 static std::string getEnv(const char* key) {
@@ -218,23 +232,39 @@ struct QtPathsInfo {
     fs::path qtInstallLibs;
     fs::path qtInstallBins;
     fs::path qtInstallPrefix;
+    fs::path qtInstallPlugins;
+    fs::path qtInstallQml;
+    fs::path qtInstallTranslations;
 };
 
 static QtPathsInfo queryQtPaths() {
     QtPathsInfo info;
     int code = 0;
+    std::string qtpathsBin = getEnv("QTPATHS_BIN");
+    if (qtpathsBin.empty()) qtpathsBin = "qtpaths";
     auto trim = [](std::string s) {
         while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
         size_t i = 0;
         while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
         return s.substr(i);
     };
-    std::string libs = runCommand("qtpaths --query QT_INSTALL_LIBS", code);
+    std::string libs = runCommand(qtpathsBin + " --query QT_INSTALL_LIBS", code);
     if (code == 0) info.qtInstallLibs = fs::path(trim(libs));
-    std::string bins = runCommand("qtpaths --query QT_INSTALL_BINS", code);
+    std::string bins = runCommand(qtpathsBin + " --query QT_INSTALL_BINS", code);
     if (code == 0) info.qtInstallBins = fs::path(trim(bins));
-    std::string prefix = runCommand("qtpaths --query QT_INSTALL_PREFIX", code);
+    std::string prefix = runCommand(qtpathsBin + " --query QT_INSTALL_PREFIX", code);
     if (code == 0) info.qtInstallPrefix = fs::path(trim(prefix));
+    std::string plugins = runCommand(qtpathsBin + " --query QT_INSTALL_PLUGINS", code);
+    if (code == 0) info.qtInstallPlugins = fs::path(trim(plugins));
+    std::string qml = runCommand(qtpathsBin + " --query QT_INSTALL_QML", code);
+    if (code == 0) info.qtInstallQml = fs::path(trim(qml));
+    std::string trans = runCommand(qtpathsBin + " --query QT_INSTALL_TRANSLATIONS", code);
+    if (code == 0) info.qtInstallTranslations = fs::path(trim(trans));
+    // Validate that queried directories exist; otherwise, leave empty so we fall back to env paths
+    std::error_code ec;
+    if (!info.qtInstallQml.empty() && !fs::exists(info.qtInstallQml, ec)) info.qtInstallQml.clear();
+    if (!info.qtInstallPlugins.empty() && !fs::exists(info.qtInstallPlugins, ec)) info.qtInstallPlugins.clear();
+    if (!info.qtInstallTranslations.empty() && !fs::exists(info.qtInstallTranslations, ec)) info.qtInstallTranslations.clear();
     return info;
 }
 
@@ -242,6 +272,8 @@ struct ResolveContext {
     DeployPlan plan;
     QtPathsInfo qt;
     std::vector<fs::path> searchDirs; // directories used to resolve deps
+    std::vector<fs::path> qmlImportPaths; // directories for QML imports
+    std::vector<fs::path> cliQmlRoots; // from --qml-root
 };
 
 static void ensureEnvForResolution(ResolveContext& ctx) {
@@ -275,6 +307,18 @@ static void ensureEnvForResolution(ResolveContext& ctx) {
             if (!path.empty()) newPath += ":" + path;
             setEnv("PATH", newPath);
         }
+        // Derive QML import paths from MinGW PATH bin entries: ../qml and ../lib/qt-6/qml
+        for (const auto& p : pv) {
+            if (p.size() > 4 && p.rfind("/bin", p.size() - 4) != std::string::npos) {
+                fs::path base = fs::path(p).parent_path();
+                std::error_code ec2;
+                fs::path q1 = base / "qml";
+                if (fs::exists(q1, ec2)) ctx.qmlImportPaths.push_back(q1);
+                ec2.clear();
+                fs::path q2 = base / "lib" / "qt-6" / "qml";
+                if (fs::exists(q2, ec2)) ctx.qmlImportPaths.push_back(q2);
+            }
+        }
     } else {
         // Mach-O: DYLD paths and frameworks
         std::string dyld = getEnv("DYLD_LIBRARY_PATH");
@@ -292,6 +336,23 @@ static void ensureEnvForResolution(ResolveContext& ctx) {
             setEnv("DYLD_FRAMEWORK_PATH", newDyldFw);
         }
     }
+
+    // Build QML import paths: include QT_INSTALL_QML and env QML2_IMPORT_PATH
+    if (!ctx.qt.qtInstallQml.empty()) {
+        std::error_code ec;
+        if (fs::exists(ctx.qt.qtInstallQml, ec)) ctx.qmlImportPaths.push_back(ctx.qt.qtInstallQml);
+    }
+    std::string qml2Env = getEnv("QML2_IMPORT_PATH");
+    for (const auto& p : splitPaths(qml2Env, ':')) {
+        if (p.empty()) continue;
+        std::error_code ec;
+        if (fs::exists(p, ec)) ctx.qmlImportPaths.emplace_back(p);
+    }
+    // Attach CLI-provided roots
+    for (const auto& r : ctx.plan.qmlRoots) ctx.cliQmlRoots.push_back(r);
+    // Env QML_ROOT may be colon-separated for multiple roots
+    std::string envRoots = getEnv("QML_ROOT");
+    for (const auto& p : splitPaths(envRoots, ':')) if (!p.empty()) ctx.cliQmlRoots.emplace_back(p);
 }
 
 static bool isQtLibraryName(const std::string& name) {
@@ -541,12 +602,16 @@ static void ensureOutputLayout(const DeployPlan& plan) {
         case BinaryType::PE: {
             // On Windows/Linux dist style: plugins/, qml/, translations/
             fs::create_directories(plan.outputRoot / "plugins", ec);
+            fs::create_directories(plan.outputRoot / "plugins" / "platforms", ec);
+            fs::create_directories(plan.outputRoot / "plugins" / "imageformats", ec);
             fs::create_directories(plan.outputRoot / "qml", ec);
             fs::create_directories(plan.outputRoot / "translations", ec);
             break;
         }
         case BinaryType::ELF: {
             fs::create_directories(plan.outputRoot / "plugins", ec);
+            fs::create_directories(plan.outputRoot / "plugins" / "platforms", ec);
+            fs::create_directories(plan.outputRoot / "plugins" / "imageformats", ec);
             fs::create_directories(plan.outputRoot / "qml", ec);
             fs::create_directories(plan.outputRoot / "translations", ec);
             break;
@@ -557,6 +622,8 @@ static void ensureOutputLayout(const DeployPlan& plan) {
             fs::create_directories(plan.outputRoot / "Contents" / "Frameworks", ec);
             fs::create_directories(plan.outputRoot / "Contents" / "Resources" / "qml", ec);
             fs::create_directories(plan.outputRoot / "Contents" / "PlugIns" / "quick", ec);
+            fs::create_directories(plan.outputRoot / "Contents" / "PlugIns" / "platforms", ec);
+            fs::create_directories(plan.outputRoot / "Contents" / "PlugIns" / "imageformats", ec);
             fs::create_directories(plan.outputRoot / "Contents" / "Resources" / "translations", ec);
             break;
         }
@@ -593,6 +660,58 @@ static void copyResolvedForPE(const DeployPlan& plan, const std::vector<fs::path
     writeQtConfIfNeeded(plan);
 }
 
+static void copyPluginsPE(const ResolveContext& ctx, const DeployPlan& plan, const std::vector<fs::path>& resolvedLibs) {
+    // Build candidate plugin roots for MinGW target
+    std::vector<fs::path> pluginRoots;
+    if (!ctx.qt.qtInstallPlugins.empty()) pluginRoots.push_back(ctx.qt.qtInstallPlugins);
+    // From env MINGW_QT_PLUGINS (colon-separated)
+    std::string mingwPlugins = getEnv("MINGW_QT_PLUGINS");
+    for (const auto& p : splitPaths(mingwPlugins, ':')) if (!p.empty()) pluginRoots.emplace_back(p);
+    // Derive from PATH entries that end with /bin → ../plugins
+    std::string path = getEnv("PATH");
+    for (const auto& p : splitPaths(path, ':')) {
+        if (p.size() > 4 && p.rfind("/bin", p.size() - 4) != std::string::npos) {
+            fs::path base = fs::path(p).parent_path();
+            std::error_code ec;
+            fs::path root1 = base / "plugins";
+            if (fs::exists(root1, ec)) pluginRoots.push_back(root1);
+            ec.clear();
+            fs::path root2 = base / "lib" / "qt-6" / "plugins";
+            if (fs::exists(root2, ec)) pluginRoots.push_back(root2);
+        }
+    }
+    // Derive from resolved Qt6Core.dll location(s)
+    for (const auto& lib : resolvedLibs) {
+        std::string base = lib.filename().string();
+        std::string lower = base; std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower == "qt6core.dll") {
+            fs::path binDir = lib.parent_path();
+            std::error_code ec;
+            fs::path root1 = binDir.parent_path() / "plugins";
+            if (fs::exists(root1, ec)) pluginRoots.push_back(root1);
+            ec.clear();
+            fs::path root2 = binDir.parent_path() / "lib" / "qt-6" / "plugins";
+            if (fs::exists(root2, ec)) pluginRoots.push_back(root2);
+        }
+    }
+
+    // Dedup
+    std::sort(pluginRoots.begin(), pluginRoots.end());
+    pluginRoots.erase(std::unique(pluginRoots.begin(), pluginRoots.end()), pluginRoots.end());
+
+    // Copy from first root that contains expected files
+    for (const auto& src : pluginRoots) {
+        fs::path platformDll = src / "platforms" / "qwindows.dll";
+        if (!fs::exists(platformDll)) continue;
+        copyFileOverwrite(platformDll, plan.outputRoot / "plugins" / "platforms" / platformDll.filename());
+        for (const char* name : {"qjpeg.dll","qico.dll","qgif.dll","qpng.dll"}) {
+            fs::path p = src / "imageformats" / name;
+            if (fs::exists(p)) copyFileOverwrite(p, plan.outputRoot / "plugins" / "imageformats" / p.filename());
+        }
+        break;
+    }
+}
+
 static void copyResolvedForELF(const DeployPlan& plan, const std::vector<fs::path>& libs) {
     fs::path libDir = plan.outputRoot / "lib";
     std::error_code ec;
@@ -622,6 +741,24 @@ static void copyResolvedForELF(const DeployPlan& plan, const std::vector<fs::pat
         }
     }
     writeQtConfIfNeeded(plan);
+}
+
+static void copyPluginsELF(const ResolveContext& ctx, const DeployPlan& plan) {
+    if (ctx.qt.qtInstallPlugins.empty()) return;
+    const fs::path src = ctx.qt.qtInstallPlugins;
+    // platform plugin
+    fs::path platformSo = src / "platforms" / "libqxcb.so";
+    if (fs::exists(platformSo)) copyFileOverwrite(platformSo, plan.outputRoot / "plugins" / "platforms" / platformSo.filename());
+    // imageformats
+    for (const char* name : {"libqjpeg.so","libqico.so","libqgif.so","libqpng.so"}) {
+        fs::path p = src / "imageformats" / name;
+        if (fs::exists(p)) copyFileOverwrite(p, plan.outputRoot / "plugins" / "imageformats" / p.filename());
+    }
+    // Set RUNPATH on plugins to $ORIGIN/../lib
+    int code = 0;
+    std::string pluginsDir = (plan.outputRoot / "plugins").string();
+    std::string cmd = std::string("find ") + shellEscape(pluginsDir) + " -type f -name '*.so*' -exec patchelf --set-rpath '$ORIGIN/../lib' {} +";
+    runCommand(cmd, code);
 }
 
 static void copyMainAndPatchELF(const DeployPlan& plan) {
@@ -685,6 +822,225 @@ static void copyResolvedForMachO(const DeployPlan& plan, const std::vector<fs::p
     }
 }
 
+static void copyPluginsMachO(const ResolveContext& ctx, const DeployPlan& plan) {
+    if (ctx.qt.qtInstallPlugins.empty()) return;
+    const fs::path src = ctx.qt.qtInstallPlugins;
+    fs::path dstBase = plan.outputRoot / "Contents" / "PlugIns";
+    // platform plugin
+    fs::path cocoa = src / "platforms" / "libqcocoa.dylib";
+    if (fs::exists(cocoa)) copyFileOverwrite(cocoa, dstBase / "platforms" / cocoa.filename());
+    // imageformats
+    for (const char* name : {"libqjpeg.dylib","libqico.dylib","libqgif.dylib","libqpng.dylib"}) {
+        fs::path p = src / "imageformats" / name;
+        if (fs::exists(p)) copyFileOverwrite(p, dstBase / "imageformats" / p.filename());
+    }
+    // Add rpath to plugins so they can find Frameworks via loader path
+    int code = 0;
+    std::string pluginsDir = (dstBase).string();
+    std::string cmd = std::string("find ") + shellEscape(pluginsDir) + " -type f -name '*.dylib' -exec llvm-install-name-tool -add_rpath '@loader_path/../Frameworks' {} +";
+    runCommand(cmd, code);
+}
+
+// --- QML import scanning and copying ---
+
+struct QmlModuleEntry {
+    fs::path sourcePath;    // absolute path to module directory
+    std::string relativePath; // relative install path under qml/
+};
+
+static std::vector<fs::path> discoverQmlRoots(const ResolveContext& ctx) {
+    std::vector<fs::path> roots;
+    // CLI-provided roots take precedence
+    for (const auto& r : ctx.cliQmlRoots) roots.push_back(r);
+    // Allow override via env QML_ROOT
+    std::string envRoot = getEnv("QML_ROOT");
+    if (!envRoot.empty()) roots.emplace_back(envRoot);
+    // Try current working directory
+    std::error_code ec;
+    fs::path cwd = fs::current_path(ec);
+    auto hasQml = [](const fs::path& d) -> bool {
+        std::error_code e;
+        if (!fs::exists(d, e) || !fs::is_directory(d, e)) return false;
+        for (auto it = fs::recursive_directory_iterator(d, fs::directory_options::skip_permission_denied, e);
+             it != fs::recursive_directory_iterator(); ++it) {
+            if (it->is_regular_file(e) && it->path().extension() == ".qml") return true;
+        }
+        return false;
+    };
+    if (!envRoot.empty() || !ctx.cliQmlRoots.empty()) {
+        // already added
+    } else {
+        if (!cwd.empty() && hasQml(cwd)) roots.push_back(cwd);
+        fs::path binDir = ctx.plan.binaryPath.parent_path();
+        if (!binDir.empty() && hasQml(binDir)) roots.push_back(binDir);
+    }
+    // Deduplicate
+    std::sort(roots.begin(), roots.end());
+    roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+    return roots;
+}
+
+static std::vector<QmlModuleEntry> runQmlImportScanner(const ResolveContext& ctx, const std::vector<fs::path>& roots) {
+    std::vector<QmlModuleEntry> result;
+    if (roots.empty()) return result;
+    // Build importPath args
+    std::string importArgs;
+    for (const auto& p : ctx.qmlImportPaths) {
+        importArgs += " -importPath " + shellEscape(p.string());
+    }
+    for (const auto& root : roots) {
+        int code = 0;
+        std::string cmd = std::string("qmlimportscanner -rootPath ") + shellEscape(root.string()) + importArgs;
+        std::string out = runCommand(cmd, code);
+        if (code != 0 || out.empty()) continue;
+        // naive JSON scan for "path" and "relativePath"
+        std::istringstream iss(out);
+        std::string line;
+        QmlModuleEntry current;
+        bool inObject = false;
+        while (std::getline(iss, line)) {
+            if (line.find('{') != std::string::npos) { inObject = true; current = QmlModuleEntry(); }
+            if (inObject) {
+                auto ppos = line.find("\"path\"");
+                if (ppos != std::string::npos) {
+                    auto q1 = line.find('"', ppos + 6);
+                    auto q2 = q1 == std::string::npos ? std::string::npos : line.find('"', q1 + 1);
+                    if (q1 != std::string::npos && q2 != std::string::npos) {
+                        current.sourcePath = fs::path(line.substr(q1 + 1, q2 - q1 - 1));
+                    }
+                }
+                auto rpos = line.find("\"relativePath\"");
+                if (rpos != std::string::npos) {
+                    auto q1 = line.find('"', rpos + 14);
+                    auto q2 = q1 == std::string::npos ? std::string::npos : line.find('"', q1 + 1);
+                    if (q1 != std::string::npos && q2 != std::string::npos) {
+                        current.relativePath = line.substr(q1 + 1, q2 - q1 - 1);
+                    }
+                }
+            }
+            if (line.find('}') != std::string::npos && inObject) {
+                inObject = false;
+                if (!current.sourcePath.empty()) {
+                    // Fallback for relativePath: try to strip QT_INSTALL_QML prefix
+                    if (current.relativePath.empty()) {
+                        std::string sp = current.sourcePath.string();
+                        std::string qp = ctx.qt.qtInstallQml.string();
+                        if (!qp.empty() && sp.rfind(qp, 0) == 0) {
+                            std::string rel = sp.substr(qp.size());
+                            if (!rel.empty() && (rel[0] == '/' || rel[0] == '\\')) rel.erase(0, 1);
+                            current.relativePath = rel;
+                        } else {
+                            current.relativePath = current.sourcePath.filename().string();
+                        }
+                    }
+                    result.push_back(current);
+                }
+            }
+        }
+    }
+    // Deduplicate by sourcePath
+    std::sort(result.begin(), result.end(), [](const QmlModuleEntry& a, const QmlModuleEntry& b){ return a.sourcePath < b.sourcePath; });
+    result.erase(std::unique(result.begin(), result.end(), [](const QmlModuleEntry& a, const QmlModuleEntry& b){ return a.sourcePath == b.sourcePath; }), result.end());
+    return result;
+}
+
+static void copyQmlModules(const ResolveContext& ctx, const DeployPlan& plan) {
+    auto roots = discoverQmlRoots(ctx);
+    if (roots.empty()) return;
+    auto modules = runQmlImportScanner(ctx, roots);
+    if (modules.empty()) return;
+    std::error_code ec;
+    fs::path qmlDestBase = plan.type == BinaryType::MACHO
+        ? plan.outputRoot / "Contents" / "Resources" / "qml"
+        : plan.outputRoot / "qml";
+    for (const auto& m : modules) {
+        fs::path dst = qmlDestBase / m.relativePath;
+        fs::create_directories(dst, ec);
+        ec.clear();
+        // Copy recursively
+        try {
+            for (auto it = fs::recursive_directory_iterator(m.sourcePath, fs::directory_options::skip_permission_denied, ec);
+                 it != fs::recursive_directory_iterator(); ++it) {
+                if (it->is_directory(ec)) continue;
+                fs::path rel = fs::relative(it->path(), m.sourcePath, ec);
+                fs::path out = dst / rel;
+                copyFileOverwrite(it->path(), out);
+                if (plan.type == BinaryType::MACHO && out.extension() == ".dylib") {
+                    // Move dylib to PlugIns/quick and leave a symlink
+                    fs::path quickDir = plan.outputRoot / "Contents" / "PlugIns" / "quick";
+                    fs::create_directories(quickDir, ec);
+                    fs::path moved = quickDir / out.filename();
+                    copyFileOverwrite(out, moved);
+                    std::error_code sec;
+                    fs::remove(out, sec);
+                    try { fs::create_symlink(fs::relative(moved, out.parent_path()), out); } catch (...) {}
+                }
+            }
+        } catch (...) {
+            std::cerr << "Warning: failed to traverse QML module: " << m.sourcePath << "\n";
+        }
+    }
+}
+
+static std::vector<fs::path> listQmlPluginLibraries(const DeployPlan& plan) {
+    std::vector<fs::path> libs;
+    std::error_code ec;
+    fs::path qmlBase = plan.type == BinaryType::MACHO
+        ? plan.outputRoot / "Contents" / "Resources" / "qml"
+        : plan.outputRoot / "qml";
+    if (!fs::exists(qmlBase, ec)) return libs;
+    std::string ext = plan.type == BinaryType::PE ? ".dll" : (plan.type == BinaryType::ELF ? ".so" : ".dylib");
+    std::set<std::string> seen;
+    for (auto it = fs::recursive_directory_iterator(qmlBase, fs::directory_options::skip_permission_denied, ec);
+         it != fs::recursive_directory_iterator(); ++it) {
+        if (!it->is_regular_file(ec)) continue;
+        if (it->path().extension() == ext) {
+            std::string key = fs::weakly_canonical(it->path(), ec).string();
+            if (!seen.count(key)) { seen.insert(key); libs.push_back(it->path()); }
+        }
+    }
+    // On macOS, actual dylibs are relocated to PlugIns/quick
+    if (plan.type == BinaryType::MACHO) {
+        fs::path quick = plan.outputRoot / "Contents" / "PlugIns" / "quick";
+        if (fs::exists(quick, ec)) {
+            for (auto it = fs::recursive_directory_iterator(quick, fs::directory_options::skip_permission_denied, ec);
+                 it != fs::recursive_directory_iterator(); ++it) {
+                if (it->is_regular_file(ec) && it->path().extension() == ".dylib") {
+                    std::string key = fs::weakly_canonical(it->path(), ec).string();
+                    if (!seen.count(key)) { seen.insert(key); libs.push_back(it->path()); }
+                }
+            }
+        }
+    }
+    return libs;
+}
+
+static void resolveQmlPluginDependencies(const DeployPlan& plan) {
+    // Resolve and copy dependencies of QML plugin libraries to the appropriate locations
+    auto qmlLibs = listQmlPluginLibraries(plan);
+    if (qmlLibs.empty()) return;
+    std::set<std::string> all;
+    for (const auto& pluginLib : qmlLibs) {
+        DeployPlan sub{plan.type, pluginLib, plan.outputRoot, plan.qmlRoots, plan.languages};
+        auto deps = resolveAndRecurse(sub);
+        for (const auto& d : deps) {
+            std::error_code ec;
+            std::string key = fs::weakly_canonical(d, ec).string();
+            all.insert(key);
+        }
+    }
+    std::vector<fs::path> uniqueDeps;
+    for (const auto& k : all) uniqueDeps.emplace_back(k);
+    if (uniqueDeps.empty()) return;
+    if (plan.type == BinaryType::PE) {
+        copyResolvedForPE(plan, uniqueDeps);
+    } else if (plan.type == BinaryType::ELF) {
+        copyResolvedForELF(plan, uniqueDeps);
+    } else {
+        copyResolvedForMachO(plan, uniqueDeps);
+    }
+}
+
 static void copyMainAndPatchMachO(const DeployPlan& plan) {
     fs::path macOSDir = plan.outputRoot / "Contents" / "MacOS";
     std::error_code ec;
@@ -710,6 +1066,96 @@ static void copyMainPE(const DeployPlan& plan) {
     }
 }
 
+// --- Translations deployment ---
+
+static std::vector<std::string> detectLanguagesFromEnv() {
+    // Prefer LC_ALL, then LANG. Basic parse like en_US.UTF-8 -> en
+    std::vector<std::string> langs;
+    auto parse = [](const std::string& s) -> std::string {
+        if (s.empty()) return {};
+        // expected form: ll[_CC][.codeset][@modifier]
+        size_t end = s.find_first_of("_.@ ");
+        std::string base = (end == std::string::npos) ? s : s.substr(0, end);
+        // Normalize to lowercase
+        std::string out = base;
+        std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c){ return std::tolower(c); });
+        return out;
+    };
+    std::string lcAll = getEnv("LC_ALL");
+    std::string lang = getEnv("LANG");
+    std::string pick = !lcAll.empty() ? lcAll : lang;
+    std::string one = parse(pick);
+    if (!one.empty()) langs.push_back(one);
+    // Always include English fallback
+    if (std::find(langs.begin(), langs.end(), std::string("en")) == langs.end()) langs.push_back("en");
+    return langs;
+}
+
+static std::vector<std::string> computeLanguages(const DeployPlan& plan) {
+    if (!plan.languages.empty()) return plan.languages;
+    return detectLanguagesFromEnv();
+}
+
+static fs::path translationsOutputDir(const DeployPlan& plan) {
+    if (plan.type == BinaryType::MACHO) return plan.outputRoot / "Contents" / "Resources" / "translations";
+    return plan.outputRoot / "translations";
+}
+
+static std::vector<fs::path> listModuleCatalogsForLang(const fs::path& qtTransDir, const std::string& lang) {
+    // Approximate windeployqt translationNameFilters: gather qtbase, qt*, and module catalogs for the language
+    std::vector<fs::path> files;
+    std::error_code ec;
+    if (!fs::exists(qtTransDir, ec) || !fs::is_directory(qtTransDir, ec)) return files;
+    for (auto it = fs::directory_iterator(qtTransDir, ec); it != fs::directory_iterator(); ++it) {
+        if (!it->is_regular_file(ec)) continue;
+        std::string name = it->path().filename().string();
+        // match *_<lang>.qm where * is a module catalog name
+        std::string suffix = std::string("_") + lang + ".qm";
+        if (name.size() > suffix.size() && name.rfind(suffix) == name.size() - suffix.size()) {
+            files.push_back(it->path());
+        }
+    }
+    return files;
+}
+
+static bool runLconvert(const std::vector<fs::path>& inputs, const fs::path& outputQm) {
+    if (inputs.empty()) return false;
+    int code = 0;
+    std::ostringstream cmd;
+    cmd << "lconvert -o " << shellEscape(outputQm.string());
+    for (const auto& in : inputs) cmd << " -i " << shellEscape(in.string());
+    runCommand(cmd.str(), code);
+    return code == 0 && fs::exists(outputQm);
+}
+
+static void copyIfExists(const fs::path& src, const fs::path& dstDir) {
+    std::error_code ec;
+    if (fs::exists(src, ec)) {
+        fs::path dst = dstDir / src.filename();
+        copyFileOverwrite(src, dst);
+    }
+}
+
+static void deployTranslations(const ResolveContext& ctx, const DeployPlan& plan) {
+    const fs::path qtTransDir = ctx.qt.qtInstallTranslations;
+    if (qtTransDir.empty()) return;
+    auto langs = computeLanguages(plan);
+    std::error_code ec;
+    fs::path outDir = translationsOutputDir(plan);
+    fs::create_directories(outDir, ec);
+    for (const auto& lang : langs) {
+        auto catalogs = listModuleCatalogsForLang(qtTransDir, lang);
+        if (catalogs.empty()) continue;
+        // Preferred: aggregate to qt_<lang>.qm
+        fs::path aggregated = outDir / (std::string("qt_") + lang + ".qm");
+        bool ok = runLconvert(catalogs, aggregated);
+        if (!ok) {
+            // Fallback: copy each catalog
+            for (const auto& c : catalogs) copyIfExists(c, outDir);
+        }
+    }
+}
+
 static void resolveDependenciesPE(const DeployPlan& plan) {
     auto libs = resolveAndRecurse(plan);
     if (!libs.empty()) {
@@ -718,6 +1164,16 @@ static void resolveDependenciesPE(const DeployPlan& plan) {
     }
     copyResolvedForPE(plan, libs);
     copyMainPE(plan);
+    // Copy a minimal plugin set
+    ResolveContext ctx{plan, queryQtPaths(), {}};
+    // pass CLI qml roots
+    // Pull from Args by re-parsing? Instead, read from env QML_ROOT only; simple workaround:
+    // We'll allow users to pass multiple --qml-root via setting QML_ROOT as colon-separated as well.
+    ensureEnvForResolution(ctx);
+    copyPluginsPE(ctx, plan, libs);
+    copyQmlModules(ctx, plan);
+    deployTranslations(ctx, plan);
+    resolveQmlPluginDependencies(plan);
 }
 
 static void resolveDependenciesELF(const DeployPlan& plan) {
@@ -728,6 +1184,12 @@ static void resolveDependenciesELF(const DeployPlan& plan) {
     }
     copyResolvedForELF(plan, libs);
     copyMainAndPatchELF(plan);
+    ResolveContext ctx{plan, queryQtPaths(), {}};
+    ensureEnvForResolution(ctx);
+    copyPluginsELF(ctx, plan);
+    copyQmlModules(ctx, plan);
+    deployTranslations(ctx, plan);
+    resolveQmlPluginDependencies(plan);
 }
 
 static void resolveDependenciesMachO(const DeployPlan& plan) {
@@ -738,6 +1200,12 @@ static void resolveDependenciesMachO(const DeployPlan& plan) {
     }
     copyResolvedForMachO(plan, libs);
     copyMainAndPatchMachO(plan);
+    ResolveContext ctx{plan, queryQtPaths(), {}};
+    ensureEnvForResolution(ctx);
+    copyPluginsMachO(ctx, plan);
+    copyQmlModules(ctx, plan);
+    deployTranslations(ctx, plan);
+    resolveQmlPluginDependencies(plan);
 }
 
 int main(int argc, char** argv) {
@@ -765,7 +1233,7 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        DeployPlan plan{*maybeType, args.binaryPath, args.outDir};
+        DeployPlan plan{*maybeType, args.binaryPath, args.outDir, args.qmlRoots, args.languages};
         std::cout << "Detected: " << toString(plan.type) << "\n";
 
         ensureOutputLayout(plan);
