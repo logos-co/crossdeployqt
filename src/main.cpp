@@ -9,6 +9,8 @@
 #include <iostream>
 #include <optional>
 #include <set>
+#include <unordered_set>
+#include <unordered_map>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -71,80 +73,107 @@ static std::optional<Args> parseArgs(int argc, char** argv) {
 // Detect binary type by reading magic bytes.
 // - PE: starts with 'MZ' then PE header at e_lfanew offset contains 'PE\0\0'
 // - ELF: 0x7F 'E' 'L' 'F'
-// - Mach-O: multiple magic values, e.g., 0xFEEDFACE, 0xFEEDFACF, 0xCAFEBABE (fat), 0xCAFED00D (fat 64)
+// - Mach-O: multiple magic values, e.g., 0xFEEDFACE, 0xFEEDFACF, etc
 static std::optional<BinaryType> detectBinaryType(const fs::path& p, std::string& whyNot) {
+    std::error_code ec;
+    const auto fileSize = fs::file_size(p, ec);
+    if (ec) { whyNot = "cannot stat file"; return std::nullopt; }
+
     std::ifstream f(p, std::ios::binary);
-    if (!f) {
-        whyNot = "cannot open file";
-        return std::nullopt;
-    }
+    if (!f) { whyNot = "cannot open file"; return std::nullopt; }
 
-    // Read first 4096 bytes to be safe
-    std::vector<unsigned char> buf(4096, 0);
-    f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
-    std::streamsize n = f.gcount();
-    if (n < 4) {
-        whyNot = "file too small";
-        return std::nullopt;
-    }
+    // Read a small prefix (we’ll read more on demand)
+    std::uint8_t buf[16] = {0};
+    f.read(reinterpret_cast<char*>(buf), sizeof(buf));
+    const std::streamsize n = f.gcount();
+    if (n < 4) { whyNot = "file too small"; return std::nullopt; }
 
-    // ELF
+    auto u32le_at = [&](std::uint64_t off, std::uint32_t& out) -> bool {
+        if (off + 4 > fileSize) return false;
+        std::uint8_t t[4];
+        f.clear(); f.seekg(static_cast<std::streamoff>(off), std::ios::beg);
+        if (!f.read(reinterpret_cast<char*>(t), 4)) return false;
+        out = static_cast<std::uint32_t>(t[0]) |
+              (static_cast<std::uint32_t>(t[1]) << 8) |
+              (static_cast<std::uint32_t>(t[2]) << 16) |
+              (static_cast<std::uint32_t>(t[3]) << 24);
+        return true;
+    };
+    auto u32be_at = [&](std::uint64_t off, std::uint32_t& out) -> bool {
+        if (off + 4 > fileSize) return false;
+        std::uint8_t t[4];
+        f.clear(); f.seekg(static_cast<std::streamoff>(off), std::ios::beg);
+        if (!f.read(reinterpret_cast<char*>(t), 4)) return false;
+        out = (static_cast<std::uint32_t>(t[0]) << 24) |
+              (static_cast<std::uint32_t>(t[1]) << 16) |
+              (static_cast<std::uint32_t>(t[2]) << 8)  |
+               static_cast<std::uint32_t>(t[3]);
+        return true;
+    };
+    auto u32be_from0 = [&]() -> std::uint32_t {
+        return (static_cast<std::uint32_t>(buf[0]) << 24) |
+               (static_cast<std::uint32_t>(buf[1]) << 16) |
+               (static_cast<std::uint32_t>(buf[2]) << 8)  |
+                static_cast<std::uint32_t>(buf[3]);
+    };
+
+    // ELF: 0x7F 'E' 'L' 'F'
     if (buf[0] == 0x7F && buf[1] == 'E' && buf[2] == 'L' && buf[3] == 'F') {
-        return BinaryType::ELF;
+        return BinaryType::ELF; // ELF magic as per ELF spec.
     }
 
-    // PE: 'M' 'Z' at start and 'PE\0\0' at e_lfanew
+    // PE: 'MZ' then 'PE\0\0' at e_lfanew
     if (buf[0] == 'M' && buf[1] == 'Z') {
-        if (n >= 0x40) {
-            // e_lfanew at 0x3C
-            uint32_t e_lfanew = static_cast<uint32_t>(buf[0x3C]) |
-                                 (static_cast<uint32_t>(buf[0x3D]) << 8) |
-                                 (static_cast<uint32_t>(buf[0x3E]) << 16) |
-                                 (static_cast<uint32_t>(buf[0x3F]) << 24);
-            if (e_lfanew + 4 < static_cast<uint32_t>(n)) {
-                if (buf[e_lfanew] == 'P' && buf[e_lfanew + 1] == 'E' && buf[e_lfanew + 2] == 0 && buf[e_lfanew + 3] == 0) {
-                    return BinaryType::PE;
-                }
-            } else {
-                // Read more if necessary
-                f.clear();
-                f.seekg(e_lfanew, std::ios::beg);
-                unsigned char peSig[4] = {0};
-                f.read(reinterpret_cast<char*>(peSig), 4);
-                if (f.gcount() == 4 && peSig[0] == 'P' && peSig[1] == 'E' && peSig[2] == 0 && peSig[3] == 0) {
+        std::uint32_t e_lfanew = 0;
+        if (fileSize >= 0x40 && u32le_at(0x3C, e_lfanew)) {
+            if (e_lfanew <= fileSize - 4) {
+                std::uint8_t sig[4] = {0};
+                f.clear(); f.seekg(static_cast<std::streamoff>(e_lfanew), std::ios::beg);
+                if (f.read(reinterpret_cast<char*>(sig), 4) && sig[0]=='P' && sig[1]=='E' && sig[2]==0 && sig[3]==0) {
                     return BinaryType::PE;
                 }
             }
         }
+        // Fall through; some non-PE files start with MZ.
     }
 
-    // Mach-O magic numbers (both endians, 32/64, fat)
-    auto readU32 = [&](size_t off) -> uint32_t {
-        if (off + 4 > static_cast<size_t>(n)) return 0;
-        return (static_cast<uint32_t>(buf[off]) << 24) |
-               (static_cast<uint32_t>(buf[off + 1]) << 16) |
-               (static_cast<uint32_t>(buf[off + 2]) << 8) |
-               (static_cast<uint32_t>(buf[off + 3]));
-    };
-    auto be = readU32(0);
-    auto le = static_cast<uint32_t>(buf[0]) |
-              (static_cast<uint32_t>(buf[1]) << 8) |
-              (static_cast<uint32_t>(buf[2]) << 16) |
-              (static_cast<uint32_t>(buf[3]) << 24);
+    // Mach-O: thin and fat (universal)
+    constexpr std::uint32_t MH_MAGIC     = 0xFEEDFACE;
+    constexpr std::uint32_t MH_CIGAM     = 0xCEFAEDFE;
+    constexpr std::uint32_t MH_MAGIC_64  = 0xFEEDFACF;
+    constexpr std::uint32_t MH_CIGAM_64  = 0xCFFAEDFE;
 
-    const uint32_t MH_MAGIC = 0xFEEDFACE;
-    const uint32_t MH_CIGAM = 0xCEFAEDFE;
-    const uint32_t MH_MAGIC_64 = 0xFEEDFACF;
-    const uint32_t MH_CIGAM_64 = 0xCFFAEDFE;
-    const uint32_t FAT_MAGIC = 0xCAFEBABE;
-    const uint32_t FAT_CIGAM = 0xBEBAFECA;
-    const uint32_t FAT_MAGIC_64 = 0xCAFED00D;
-    const uint32_t FAT_CIGAM_64 = 0xD00DFECA;
+    constexpr std::uint32_t FAT_MAGIC    = 0xCAFEBABE;
+    constexpr std::uint32_t FAT_CIGAM    = 0xBEBAFECA;
+    constexpr std::uint32_t FAT_MAGIC_64 = 0xCAFEBABF;
+    constexpr std::uint32_t FAT_CIGAM_64 = 0xBFBAFECA;
 
-    if (be == MH_MAGIC || be == MH_MAGIC_64 ||
-        be == MH_CIGAM || be == MH_CIGAM_64 ||
-        be == FAT_MAGIC || be == FAT_MAGIC_64 ||
-        be == FAT_CIGAM || be == FAT_CIGAM_64) {
+    const std::uint32_t be = u32be_from0();
+
+    // Thin Mach-O (both endians, 32/64)
+    if (be == MH_MAGIC || be == MH_CIGAM || be == MH_MAGIC_64 || be == MH_CIGAM_64) {
+        return BinaryType::MACHO;
+    }
+
+    // Fat Mach-O (universal)
+    if (be == FAT_MAGIC || be == FAT_MAGIC_64 || be == FAT_CIGAM || be == FAT_CIGAM_64) {
+        // Quick sanity check to avoid Java .class false positives (also CAFEBABE):
+        // Read nfat_arch and ensure it's plausible, and header fits.
+        std::uint32_t nfat_arch = 0;
+        bool be_header = (be == FAT_MAGIC || be == FAT_MAGIC_64);
+        bool ok = be_header ? u32be_at(4, nfat_arch) : u32le_at(4, nfat_arch);
+        if (!ok) { whyNot = "truncated fat header"; return std::nullopt; }
+
+        if (nfat_arch == 0 || nfat_arch > 64) { // typical range is small (1–5)
+            whyNot = "CAFEBABE but invalid nfat_arch (likely not Mach-O)";
+            return std::nullopt;
+        }
+
+        // Minimal size check for header + arch table (don’t assume Apple headers available)
+        const std::uint64_t minEntrySize = (be == FAT_MAGIC_64 || be == FAT_CIGAM_64) ? 32 /* fat_arch_64 */ : 20 /* fat_arch */;
+        const std::uint64_t need = 8 + static_cast<std::uint64_t>(nfat_arch) * minEntrySize;
+        if (need > fileSize) { whyNot = "fat header larger than file"; return std::nullopt; }
+
         return BinaryType::MACHO;
     }
 
@@ -159,6 +188,11 @@ static const char* toString(BinaryType t) {
         case BinaryType::MACHO: return "Mach-O";
     }
     return "?";
+}
+
+static bool isVerbose() {
+    static bool v = [](){ const char* e = std::getenv("CROSSDEPLOYQT_VERBOSE"); return e && *e; }();
+    return v;
 }
 
 // Stubs for later platform-specific actions
@@ -547,10 +581,11 @@ static std::vector<fs::path> resolveAndRecurse(const DeployPlan& plan) {
         }
     }
 
-    std::set<std::string> visited; // canonical path strings
+    std::unordered_set<std::string> visited; // canonical path strings
     while (!stack.empty()) {
         fs::path cur = stack.back();
         stack.pop_back();
+        if (isVerbose()) std::cout << "[resolve] Inspect: " << cur << "\n";
         std::error_code ec;
         fs::path canon = fs::weakly_canonical(cur, ec);
         std::string key = ec ? cur.string() : canon.string();
@@ -568,9 +603,11 @@ static std::vector<fs::path> resolveAndRecurse(const DeployPlan& plan) {
         }
 
         for (const auto& dep : prChild.dependencies) {
+            if (isVerbose()) std::cout << "[resolve]   dep: " << dep << "\n";
             auto found = findLibrary(dep, ctx);
             if (found) {
                 if (shouldDeployLibrary(*found, dep, plan.type, ctx)) {
+                    if (isVerbose()) std::cout << "[resolve]     push: " << *found << "\n";
                     stack.push_back(*found);
                 }
             } else {
@@ -583,6 +620,7 @@ static std::vector<fs::path> resolveAndRecurse(const DeployPlan& plan) {
     }
 
     std::vector<fs::path> libs;
+    libs.reserve(visited.size());
     for (const auto& k : visited) {
         if (k == plan.binaryPath.string()) continue;
         libs.emplace_back(k);
@@ -635,7 +673,25 @@ static bool copyFileOverwrite(const fs::path& from, const fs::path& to) {
     std::error_code ec;
     fs::create_directories(to.parent_path(), ec);
     ec.clear();
-    return fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
+    // Skip if destination exists with same size and timestamp newer-or-equal to source
+    std::error_code se1, se2;
+    auto srcStatus = fs::status(from, se1);
+    auto dstStatus = fs::status(to, se2);
+    if (!se2 && fs::exists(to) && fs::is_regular_file(dstStatus)) {
+        std::error_code te1, te2;
+        auto srcSize = fs::file_size(from, te1);
+        auto dstSize = fs::file_size(to, te2);
+        std::error_code le1, le2;
+        auto srcTime = fs::last_write_time(from, le1);
+        auto dstTime = fs::last_write_time(to, le2);
+        if (!te1 && !te2 && !le1 && !le2 && srcSize == dstSize && dstTime >= srcTime) {
+            if (isVerbose()) std::cout << "[copy-skip] " << from << " -> " << to << "\n";
+            return true;
+        }
+    }
+    bool ok = fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
+    if (!ok && isVerbose()) std::cout << "[copy-fail] " << from << " -> " << to << ": " << ec.message() << "\n";
+    return ok;
 }
 
 static void writeQtConfIfNeeded(const DeployPlan& plan) {
@@ -791,8 +847,9 @@ static void copyResolvedForMachO(const DeployPlan& plan, const std::vector<fs::p
     fs::path fwDir = plan.outputRoot / "Contents" / "Frameworks";
     std::error_code ec;
     fs::create_directories(fwDir, ec);
-    std::set<std::string> copiedFrameworks;
+    std::unordered_set<std::string> copiedFrameworks;
     for (const auto& lib : libs) {
+        if (isVerbose()) std::cout << "[macho-copy] lib: " << lib << "\n";
         // Detect frameworks by traversing parents
         fs::path candidate = lib;
         fs::path frameworkRoot;
@@ -807,7 +864,8 @@ static void copyResolvedForMachO(const DeployPlan& plan, const std::vector<fs::p
             if (!copiedFrameworks.count(key)) {
                 copiedFrameworks.insert(key);
                 // copy entire framework directory
-                fs::copy(frameworkRoot, dst, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+                if (isVerbose()) std::cout << "[macho-copy] framework: " << frameworkRoot << " -> " << dst << "\n";
+                fs::copy(frameworkRoot, dst, fs::copy_options::recursive | fs::copy_options::overwrite_existing | fs::copy_options::skip_symlinks, ec);
                 if (ec) {
                     std::cerr << "Warning: failed to copy framework " << frameworkRoot << " -> " << dst << ": " << ec.message() << "\n";
                 }
@@ -815,6 +873,7 @@ static void copyResolvedForMachO(const DeployPlan& plan, const std::vector<fs::p
         } else {
             // regular .dylib
             fs::path dest = fwDir / lib.filename();
+            if (isVerbose()) std::cout << "[macho-copy] dylib: " << lib << " -> " << dest << "\n";
             if (!copyFileOverwrite(lib, dest)) {
                 std::cerr << "Warning: failed to copy " << lib << " -> " << dest << "\n";
             }
@@ -834,11 +893,19 @@ static void copyPluginsMachO(const ResolveContext& ctx, const DeployPlan& plan) 
         fs::path p = src / "imageformats" / name;
         if (fs::exists(p)) copyFileOverwrite(p, dstBase / "imageformats" / p.filename());
     }
-    // Add rpath to plugins so they can find Frameworks via loader path
-    int code = 0;
-    std::string pluginsDir = (dstBase).string();
-    std::string cmd = std::string("find ") + shellEscape(pluginsDir) + " -type f -name '*.dylib' -exec llvm-install-name-tool -add_rpath '@loader_path/../Frameworks' {} +";
-    runCommand(cmd, code);
+    // Add rpath to plugins so they can find Frameworks via loader path (per-file for compatibility)
+    std::error_code ec;
+    if (fs::exists(dstBase, ec)) {
+        for (auto it = fs::recursive_directory_iterator(dstBase, fs::directory_options::skip_permission_denied, ec);
+             it != fs::recursive_directory_iterator(); ++it) {
+            if (it->is_regular_file(ec) && it->path().extension() == ".dylib") {
+                int code = 0;
+                // From Contents/PlugIns/(...)/<lib>.dylib to Contents/Frameworks is ../../Frameworks
+                std::string cmd = std::string("llvm-install-name-tool -add_rpath '@loader_path/../../Frameworks' ") + shellEscape(it->path().string());
+                runCommand(cmd, code);
+            }
+        }
+    }
 }
 
 // --- QML import scanning and copying ---
@@ -947,6 +1014,11 @@ static std::vector<QmlModuleEntry> runQmlImportScanner(const ResolveContext& ctx
 static void copyQmlModules(const ResolveContext& ctx, const DeployPlan& plan) {
     auto roots = discoverQmlRoots(ctx);
     if (roots.empty()) return;
+    if (isVerbose()) {
+        std::cout << "[qml] roots:";
+        for (auto& r : roots) std::cout << " " << r;
+        std::cout << "\n";
+    }
     auto modules = runQmlImportScanner(ctx, roots);
     if (modules.empty()) return;
     std::error_code ec;
@@ -954,14 +1026,17 @@ static void copyQmlModules(const ResolveContext& ctx, const DeployPlan& plan) {
         ? plan.outputRoot / "Contents" / "Resources" / "qml"
         : plan.outputRoot / "qml";
     for (const auto& m : modules) {
+        if (isVerbose()) std::cout << "[qml] module: " << m.sourcePath << " -> " << (qmlDestBase / m.relativePath) << "\n";
         fs::path dst = qmlDestBase / m.relativePath;
         fs::create_directories(dst, ec);
         ec.clear();
         // Copy recursively
         try {
+            // Prefer copying files first, skipping symlinks for speed and to avoid re-traversal via links
             for (auto it = fs::recursive_directory_iterator(m.sourcePath, fs::directory_options::skip_permission_denied, ec);
                  it != fs::recursive_directory_iterator(); ++it) {
                 if (it->is_directory(ec)) continue;
+                if (it->is_symlink(ec)) continue;
                 fs::path rel = fs::relative(it->path(), m.sourcePath, ec);
                 fs::path out = dst / rel;
                 copyFileOverwrite(it->path(), out);
@@ -970,6 +1045,7 @@ static void copyQmlModules(const ResolveContext& ctx, const DeployPlan& plan) {
                     fs::path quickDir = plan.outputRoot / "Contents" / "PlugIns" / "quick";
                     fs::create_directories(quickDir, ec);
                     fs::path moved = quickDir / out.filename();
+                    if (isVerbose()) std::cout << "[qml] move dylib: " << out << " -> " << moved << "\n";
                     copyFileOverwrite(out, moved);
                     std::error_code sec;
                     fs::remove(out, sec);
@@ -990,7 +1066,7 @@ static std::vector<fs::path> listQmlPluginLibraries(const DeployPlan& plan) {
         : plan.outputRoot / "qml";
     if (!fs::exists(qmlBase, ec)) return libs;
     std::string ext = plan.type == BinaryType::PE ? ".dll" : (plan.type == BinaryType::ELF ? ".so" : ".dylib");
-    std::set<std::string> seen;
+    std::unordered_set<std::string> seen;
     for (auto it = fs::recursive_directory_iterator(qmlBase, fs::directory_options::skip_permission_denied, ec);
          it != fs::recursive_directory_iterator(); ++it) {
         if (!it->is_regular_file(ec)) continue;
@@ -1016,21 +1092,59 @@ static std::vector<fs::path> listQmlPluginLibraries(const DeployPlan& plan) {
 }
 
 static void resolveQmlPluginDependencies(const DeployPlan& plan) {
-    // Resolve and copy dependencies of QML plugin libraries to the appropriate locations
+    // Single-pass BFS over dependencies starting from all plugin libs
     auto qmlLibs = listQmlPluginLibraries(plan);
     if (qmlLibs.empty()) return;
-    std::set<std::string> all;
-    for (const auto& pluginLib : qmlLibs) {
-        DeployPlan sub{plan.type, pluginLib, plan.outputRoot, plan.qmlRoots, plan.languages};
-        auto deps = resolveAndRecurse(sub);
-        for (const auto& d : deps) {
-            std::error_code ec;
-            std::string key = fs::weakly_canonical(d, ec).string();
-            all.insert(key);
+
+    ResolveContext ctx{plan, queryQtPaths(), {}};
+    ensureEnvForResolution(ctx);
+
+    // Seed stack with plugin libs
+    std::vector<fs::path> stack;
+    for (const auto& lib : qmlLibs) {
+        if (isVerbose()) std::cout << "[qml-deps] seed: " << lib << "\n";
+        stack.push_back(lib);
+    }
+
+    std::unordered_set<std::string> visited;
+    std::unordered_set<std::string> result;
+    while (!stack.empty()) {
+        fs::path cur = stack.back();
+        stack.pop_back();
+        std::error_code ec;
+        fs::path canon = fs::weakly_canonical(cur, ec);
+        std::string key = ec ? cur.string() : canon.string();
+        if (visited.count(key)) continue;
+        visited.insert(key);
+
+        ParseResult prChild;
+        if (plan.type == BinaryType::ELF) {
+            prChild = parseELF(cur);
+            for (const auto& rp : prChild.rpaths) ctx.searchDirs.emplace_back(rp);
+        } else if (plan.type == BinaryType::PE) {
+            prChild = parsePE(cur);
+        } else {
+            prChild = parseMachO(cur);
+        }
+
+        for (const auto& dep : prChild.dependencies) {
+            if (isVerbose()) std::cout << "[qml-deps]   dep: " << dep << "\n";
+            auto found = findLibrary(dep, ctx);
+            if (found) {
+                // We want to deploy library dependencies (not the plugin lib itself)
+                if (shouldDeployLibrary(*found, dep, plan.type, ctx)) {
+                    // Add to result set if not one of the plugin libs themselves
+                    std::string fkey = fs::weakly_canonical(*found, ec).string();
+                    if (isVerbose()) std::cout << "[qml-deps]     push: " << *found << "\n";
+                    if (!visited.count(fkey)) stack.push_back(*found);
+                    result.insert(fkey);
+                }
+            }
         }
     }
+
     std::vector<fs::path> uniqueDeps;
-    for (const auto& k : all) uniqueDeps.emplace_back(k);
+    for (const auto& k : result) uniqueDeps.emplace_back(k);
     if (uniqueDeps.empty()) return;
     if (plan.type == BinaryType::PE) {
         copyResolvedForPE(plan, uniqueDeps);
@@ -1038,6 +1152,166 @@ static void resolveQmlPluginDependencies(const DeployPlan& plan) {
         copyResolvedForELF(plan, uniqueDeps);
     } else {
         copyResolvedForMachO(plan, uniqueDeps);
+    }
+}
+
+// --- macOS install_name/rpath fixups ---
+
+static bool pathStartsWith(const fs::path& p, const fs::path& prefix) {
+    std::error_code ec;
+    auto pc = fs::weakly_canonical(p, ec);
+    auto pr = fs::weakly_canonical(prefix, ec);
+    std::string ps = pc.string();
+    std::string prs = pr.string();
+    if (prs.empty()) return false;
+    if (ps.size() < prs.size()) return false;
+    return ps.compare(0, prs.size(), prs) == 0;
+}
+
+static std::pair<std::optional<std::string>, std::vector<std::string>> parseOtoolDepsWithId(const fs::path& bin) {
+    int code = 0;
+    std::string out = runCommand("llvm-otool -L " + shellEscape(bin.string()), code);
+    std::optional<std::string> id;
+    std::vector<std::string> deps;
+    if (code != 0 || out.empty()) return {id, deps};
+    std::istringstream iss(out);
+    std::string line;
+    bool first = true;
+    while (std::getline(iss, line)) {
+        if (first) { first = false; continue; }
+        size_t start = 0; while (start < line.size() && std::isspace(static_cast<unsigned char>(line[start]))) ++start;
+        size_t end = start;
+        while (end < line.size() && !std::isspace(static_cast<unsigned char>(line[end])) && line[end] != '(') ++end;
+        if (end <= start) continue;
+        std::string token = line.substr(start, end - start);
+        if (!id.has_value()) id = token; // install id appears first for dylibs
+        deps.push_back(token);
+    }
+    return {id, deps};
+}
+
+static std::string frameworkInstallNameFromPath(const fs::path& binPath, const fs::path& bundleRoot) {
+    // Expect .../Contents/Frameworks/Name.framework/Versions/<V>/Name
+    std::error_code ec;
+    auto rel = fs::relative(binPath, bundleRoot, ec).string();
+    // Find "Frameworks/Name.framework/Versions/<V>/Name"
+    auto posFw = rel.find("Frameworks/");
+    if (posFw != std::string::npos) {
+        std::string after = rel.substr(posFw + std::string("Frameworks/").size());
+        auto posFramework = after.find(".framework/");
+        if (posFramework != std::string::npos) {
+            std::string name = after.substr(0, posFramework);
+            // Try to get version segment
+            std::string tail = after.substr(posFramework + std::string(".framework/").size());
+            std::string version = "A";
+            auto posVersions = tail.find("Versions/");
+            if (posVersions != std::string::npos) {
+                std::string afterVersions = tail.substr(posVersions + std::string("Versions/").size());
+                auto slash = afterVersions.find('/');
+                if (slash != std::string::npos) version = afterVersions.substr(0, slash);
+            }
+            return std::string("@rpath/") + name + ".framework/Versions/" + version + "/" + name;
+        }
+    }
+    // Fallback to @rpath/<filename>
+    return std::string("@rpath/") + binPath.filename().string();
+}
+
+static void fixInstallNamesMachO(const DeployPlan& plan) {
+    fs::path bundle = plan.outputRoot;
+    fs::path macOSDir = bundle / "Contents" / "MacOS";
+    fs::path fwDir = bundle / "Contents" / "Frameworks";
+    fs::path pluginsDir = bundle / "Contents" / "PlugIns";
+    std::error_code ec;
+
+    // Helper: find the actual framework binary inside a .framework root
+    auto findFrameworkBinary = [&](const fs::path& frameworkRoot) -> std::optional<fs::path> {
+        // Framework name is the last path component without .framework suffix
+        std::string name = frameworkRoot.filename().string();
+        const std::string suffix = ".framework";
+        if (name.size() > suffix.size() && name.rfind(suffix) == name.size() - suffix.size()) {
+            name = name.substr(0, name.size() - suffix.size());
+        }
+        fs::path versions = frameworkRoot / "Versions";
+        std::error_code lec;
+        if (fs::exists(versions, lec) && fs::is_directory(versions, lec)) {
+            // Prefer Current symlink if present
+            fs::path current = versions / "Current";
+            if (fs::exists(current, lec)) {
+                fs::path cand = current / name;
+                if (fs::exists(cand, lec) && fs::is_regular_file(cand, lec)) return cand;
+            }
+            // Fallback: try common letter versions (A, B, etc.)
+            for (const char v : std::string("ABCDEFGHIJKLMNOPQRSTUVWXYZ")) {
+                fs::path cand = versions / std::string(1, v) / name;
+                if (fs::exists(cand, lec) && fs::is_regular_file(cand, lec)) return cand;
+            }
+            // As last resort, scan versions subdirs
+            for (auto it = fs::directory_iterator(versions, lec); it != fs::directory_iterator(); ++it) {
+                if (!it->is_directory(lec)) continue;
+                fs::path cand = it->path() / name;
+                if (fs::exists(cand, lec) && fs::is_regular_file(cand, lec)) return cand;
+            }
+        }
+        return std::nullopt;
+    };
+
+    // Collect binaries to process
+    std::vector<fs::path> bins;
+    if (fs::exists(macOSDir, ec)) {
+        for (auto it = fs::directory_iterator(macOSDir, ec); it != fs::directory_iterator(); ++it) {
+            if (it->is_regular_file(ec)) bins.push_back(it->path());
+        }
+    }
+    if (fs::exists(fwDir, ec)) {
+        // Add each framework binary once
+        for (auto it = fs::recursive_directory_iterator(fwDir, fs::directory_options::skip_permission_denied, ec);
+             it != fs::recursive_directory_iterator(); ++it) {
+            if (!it->is_directory(ec)) continue;
+            if (it->path().extension() != ".framework") continue;
+            auto bin = findFrameworkBinary(it->path());
+            if (bin) bins.push_back(*bin);
+        }
+        // Include standalone dylibs inside Frameworks (rare but possible)
+        for (auto it = fs::recursive_directory_iterator(fwDir, fs::directory_options::skip_permission_denied, ec);
+             it != fs::recursive_directory_iterator(); ++it) {
+            if (it->is_regular_file(ec) && it->path().extension() == ".dylib") bins.push_back(it->path());
+        }
+    }
+    if (fs::exists(pluginsDir, ec)) {
+        for (auto it = fs::recursive_directory_iterator(pluginsDir, fs::directory_options::skip_permission_denied, ec);
+             it != fs::recursive_directory_iterator(); ++it) {
+            if (it->is_regular_file(ec) && it->path().extension() == ".dylib") bins.push_back(it->path());
+        }
+    }
+
+    // De-dupe
+    std::sort(bins.begin(), bins.end());
+    bins.erase(std::unique(bins.begin(), bins.end()), bins.end());
+
+    // First, set IDs for bundle-local libraries
+    for (const auto& b : bins) {
+        // Only set -id for items under Frameworks (dylibs/frameworks)
+        if (pathStartsWith(b, fwDir)) {
+            std::string newId = frameworkInstallNameFromPath(b, bundle);
+            int code = 0;
+            std::string cmd = std::string("llvm-install-name-tool -id ") + shellEscape(newId) + " " + shellEscape(b.string());
+            runCommand(cmd, code);
+        }
+    }
+
+    // Then, rewrite dependency references in all binaries to use @rpath for bundle-local frameworks/dylibs
+    for (const auto& b : bins) {
+        auto pr = parseOtoolDepsWithId(b);
+        for (const auto& dep : pr.second) {
+            fs::path depPath(dep);
+            if (pathStartsWith(depPath, fwDir)) {
+                std::string newRef = frameworkInstallNameFromPath(depPath, bundle);
+                int code = 0;
+                std::string cmd = std::string("llvm-install-name-tool -change ") + shellEscape(dep) + " " + shellEscape(newRef) + " " + shellEscape(b.string());
+                runCommand(cmd, code);
+            }
+        }
     }
 }
 
@@ -1206,6 +1480,8 @@ static void resolveDependenciesMachO(const DeployPlan& plan) {
     copyQmlModules(ctx, plan);
     deployTranslations(ctx, plan);
     resolveQmlPluginDependencies(plan);
+    // Ensure rpaths and install names are correct for app, frameworks, and plugins
+    fixInstallNamesMachO(plan);
 }
 
 int main(int argc, char** argv) {

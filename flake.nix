@@ -31,6 +31,9 @@
           ];
         };
 
+        lib = pkgs.lib;
+        isLinux  = pkgs.stdenv.hostPlatform.isLinux;
+
         windowsTriple = "x86_64-w64-mingw32";
         mingw = pkgs.pkgsCross.mingwW64;
 
@@ -43,6 +46,8 @@
           qt6.qtdeclarative # qmlimportscanner
 
           llvmPackages.llvm # macOS llvm-otool and llvm-install-name-tool
+        ]
+        ++ lib.optionals isLinux [
           patchelf          # Linux RUNPATH updates
           pkgsCross.mingwW64.buildPackages.binutils # x86_64-w64-mingw32-objdump
         ];
@@ -62,7 +67,8 @@
               export PATH="${pkgs.qt6.qtdeclarative}/libexec:$PATH"
               # Hint for our tool if multiple Qt versions are present
               export QTPATHS_BIN=${pkgs.qt6.qtbase}/bin/qtpaths
-
+            ''
+            + lib.optionalString isLinux ''
               # Make Windows (MinGW) Qt DLLs discoverable for PE dependency scanning
               export MINGW_QT_BIN=${mingw.qt6.qtbase}/bin:${mingw.qt6.qtdeclarative}/bin
               export MINGW_RUNTIME_LIBS=${mingw.stdenv.cc.cc.lib}/${windowsTriple}/lib
@@ -78,7 +84,8 @@ ${mingw.openssl}/bin"
               export PATH="$MINGW_QT_BIN:$MINGW_RUNTIME_LIBS:$MINGW_EXTRA_DLLS:$PATH"
               # Provide plugin roots for MinGW (both legacy and Qt6 layout)
               export MINGW_QT_PLUGINS=${mingw.qt6.qtbase}/plugins:${mingw.qt6.qtdeclarative}/plugins:${mingw.qt6.qtbase}/lib/qt-6/plugins:${mingw.qt6.qtdeclarative}/lib/qt-6/plugins
-
+            ''
+            + ''
               echo "cmake -S . -B build"
               echo "cmake --build build -j"
               echo "./build/crossdeployqt --bin ~/experiments/logos-app/build-windows/bin/logos.exe --out ./dist-win/"
