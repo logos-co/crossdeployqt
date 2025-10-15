@@ -31,6 +31,9 @@
           ];
         };
 
+        windowsTriple = "x86_64-w64-mingw32";
+        mingw = pkgs.pkgsCross.mingwW64;
+
         common = with pkgs; [
           cmake
           ninja
@@ -39,6 +42,7 @@
           qt6.qtbase # qtpaths
 
           llvmPackages.llvm # macOS llvm-otool and llvm-install-name-tool
+          patchelf          # Linux RUNPATH updates
           pkgsCross.mingwW64.buildPackages.binutils # x86_64-w64-mingw32-objdump
         ];
            
@@ -50,10 +54,28 @@
             packages = common;
 
             shellHook = ''
+              # Host Qt search paths for plugins and QML (used by Qt tools and for runtime testing)
+              export QT_PLUGIN_PATH=${pkgs.qt6.qtbase}/lib/qt-6/plugins
+              export QML2_IMPORT_PATH=${pkgs.qt6.qtdeclarative}/lib/qt-6/qml
+
+              # Make Windows (MinGW) Qt DLLs discoverable for PE dependency scanning
+              export MINGW_QT_BIN=${mingw.qt6.qtbase}/bin:${mingw.qt6.qtdeclarative}/bin
+              export MINGW_RUNTIME_LIBS=${mingw.stdenv.cc.cc.lib}/${windowsTriple}/lib
+              export MINGW_EXTRA_DLLS=\
+"${mingw.windows.pthreads}/bin:\
+${mingw.zlib}/bin:\
+${mingw.pcre2}/bin:\
+${mingw.zstd}/bin:\
+${mingw.libb2}/bin:\
+${mingw.double-conversion}/bin:\
+${mingw.libpng}/bin:\
+${mingw.openssl}/bin"
+              export PATH="$MINGW_QT_BIN:$MINGW_RUNTIME_LIBS:$MINGW_EXTRA_DLLS:$PATH"
+
               echo "cmake -S . -B build"
               echo "cmake --build build -j"
               echo "./build/crossdeployqt --bin ~/experiments/logos-app/build-windows/bin/logos.exe --out ./dist-win/"
-              echo "./build/crossdeployqt --bin ~/experiments/logos-app/build/bin/logos --out ./dist-linux
+              echo "./build/crossdeployqt --bin ~/experiments/logos-app/build/bin/logos --out ./dist-linux/"
               echo "./build/crossdeployqt --bin ~/experiments/logos-app/build-macos/bin/logos.app/Contents/MacOS/logos --out ./dist-macos/"
             '';
           };

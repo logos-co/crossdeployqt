@@ -199,6 +199,21 @@ static std::string runCommand(const std::string& cmd, int& exitCode) {
     return result;
 }
 
+static std::string shellEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    out.push_back('\'');
+    for (char c : s) {
+        if (c == '\'') {
+            out += "'\\''"; // end quote, escaped quote, reopen
+        } else {
+            out.push_back(c);
+        }
+    }
+    out.push_back('\'');
+    return out;
+}
+
 struct QtPathsInfo {
     fs::path qtInstallLibs;
     fs::path qtInstallBins;
@@ -310,8 +325,9 @@ static bool shouldDeployLibrary(const fs::path& libPath, const std::string& sona
             "ntdll.dll","sechost.dll","shlwapi.dll","comdlg32.dll","imm32.dll","version.dll","winmm.dll","cfgmgr32.dll"
         };
         for (auto d : systemDlls) if (lower == d) return false;
-        // Include if Qt-ish, in Qt path, or alongside binary
-        return isQtLibraryName(base) || inQtPath() || dir == ctx.plan.binaryPath.parent_path();
+        // Include if path is within Nix store (cross env), Qt-ish, in Qt path, or alongside binary
+        const bool inNixStore = libPath.string().rfind("/nix/store/", 0) == 0;
+        return inNixStore || isQtLibraryName(base) || inQtPath() || dir == ctx.plan.binaryPath.parent_path();
     } else { // Mach-O
         std::string s = libPath.string();
         if (s.rfind("/System/Library/Frameworks/", 0) == 0 || s.rfind("/usr/lib/", 0) == 0) return false;
@@ -399,6 +415,26 @@ static ParseResult parseELF(const fs::path& bin) {
     return r;
 }
 
+static std::optional<std::string> queryElfSoname(const fs::path& soPath) {
+    int code = 0;
+    std::string out = runCommand("objdump -p '" + soPath.string() + "'", code);
+    if (code != 0) return std::nullopt;
+    std::istringstream iss(out);
+    std::string line;
+    while (std::getline(iss, line)) {
+        auto pos = line.find("SONAME");
+        if (pos != std::string::npos) {
+            auto sp = line.find_last_of(' ');
+            if (sp != std::string::npos && sp + 1 < line.size()) {
+                std::string name = line.substr(sp + 1);
+                while (!name.empty() && (name.back() == '\r' || name.back() == '\n')) name.pop_back();
+                if (!name.empty()) return name;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 static ParseResult parseMachO(const fs::path& bin) {
     ParseResult r;
     int code = 0;
@@ -422,7 +458,7 @@ static ParseResult parseMachO(const fs::path& bin) {
     return r;
 }
 
-static void resolveAndRecurse(const DeployPlan& plan) {
+static std::vector<fs::path> resolveAndRecurse(const DeployPlan& plan) {
     ResolveContext ctx{plan, queryQtPaths(), {}};
     ensureEnvForResolution(ctx);
 
@@ -485,12 +521,12 @@ static void resolveAndRecurse(const DeployPlan& plan) {
         }
     }
 
-    // Print summary of resolved libraries to stdout for now
-    std::cout << "Resolved shared libraries (filtered):\n";
+    std::vector<fs::path> libs;
     for (const auto& k : visited) {
         if (k == plan.binaryPath.string()) continue;
-        std::cout << "  " << k << "\n";
+        libs.emplace_back(k);
     }
+    return libs;
 }
 
 static void ensureOutputLayout(const DeployPlan& plan) {
@@ -528,16 +564,180 @@ static void ensureOutputLayout(const DeployPlan& plan) {
 }
 
 // Dependency resolution stubs to implement next
+static bool copyFileOverwrite(const fs::path& from, const fs::path& to) {
+    std::error_code ec;
+    fs::create_directories(to.parent_path(), ec);
+    ec.clear();
+    return fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
+}
+
+static void writeQtConfIfNeeded(const DeployPlan& plan) {
+    if (plan.type == BinaryType::MACHO) return;
+    fs::path conf = plan.outputRoot / "qt.conf";
+    std::ofstream ofs(conf);
+    if (!ofs) return;
+    ofs << "[Paths]\n";
+    ofs << "Prefix=." << "\n";
+    ofs << "Plugins=plugins" << "\n";
+    ofs << "Qml2Imports=qml" << "\n";
+    ofs << "Translations=translations" << "\n";
+}
+
+static void copyResolvedForPE(const DeployPlan& plan, const std::vector<fs::path>& libs) {
+    for (const auto& lib : libs) {
+        fs::path dest = plan.outputRoot / lib.filename();
+        if (!copyFileOverwrite(lib, dest)) {
+            std::cerr << "Warning: failed to copy " << lib << " -> " << dest << "\n";
+        }
+    }
+    writeQtConfIfNeeded(plan);
+}
+
+static void copyResolvedForELF(const DeployPlan& plan, const std::vector<fs::path>& libs) {
+    fs::path libDir = plan.outputRoot / "lib";
+    std::error_code ec;
+    fs::create_directories(libDir, ec);
+    for (const auto& lib : libs) {
+        fs::path dest = libDir / lib.filename();
+        if (!copyFileOverwrite(lib, dest)) {
+            std::cerr << "Warning: failed to copy " << lib << " -> " << dest << "\n";
+            continue;
+        }
+        // Create SONAME symlink if needed (e.g., libFoo.so.6 -> libFoo.so.6.X.Y)
+        auto soname = queryElfSoname(lib);
+        if (soname) {
+            const std::string destName = dest.filename().string();
+            if (*soname != destName) {
+                fs::path linkPath = libDir / *soname;
+                std::error_code sec;
+                if (fs::exists(linkPath)) fs::remove(linkPath, sec);
+                sec.clear();
+                try {
+                    fs::create_symlink(dest.filename(), linkPath);
+                } catch (...) {
+                    // Fallback: copy again under SONAME
+                    copyFileOverwrite(dest, linkPath);
+                }
+            }
+        }
+    }
+    writeQtConfIfNeeded(plan);
+}
+
+static void copyMainAndPatchELF(const DeployPlan& plan) {
+    // Copy main binary into output root
+    fs::path dest = plan.outputRoot / plan.binaryPath.filename();
+    if (!copyFileOverwrite(plan.binaryPath, dest)) {
+        std::cerr << "Warning: failed to copy main binary: " << plan.binaryPath << " -> " << dest << "\n";
+        return;
+    }
+    // Set RUNPATH to $ORIGIN/lib
+    int code = 0;
+    std::string cmd = std::string("patchelf --set-rpath '$ORIGIN/lib' ") + shellEscape(dest.string());
+    runCommand(cmd, code);
+    if (code != 0) {
+        std::cerr << "Warning: patchelf failed to set RUNPATH on " << dest << "\n";
+    }
+}
+
+static fs::path findFrameworkRoot(const fs::path& binaryInsideFramework) {
+    fs::path p = binaryInsideFramework;
+    // climb up until a parent ending with .framework
+    while (!p.empty() && p.has_parent_path()) {
+        if (p.extension() == ".framework") return p;
+        p = p.parent_path();
+    }
+    return {};
+}
+
+static void copyResolvedForMachO(const DeployPlan& plan, const std::vector<fs::path>& libs) {
+    fs::path fwDir = plan.outputRoot / "Contents" / "Frameworks";
+    std::error_code ec;
+    fs::create_directories(fwDir, ec);
+    std::set<std::string> copiedFrameworks;
+    for (const auto& lib : libs) {
+        // Detect frameworks by traversing parents
+        fs::path candidate = lib;
+        fs::path frameworkRoot;
+        fs::path cur = candidate.parent_path();
+        while (!cur.empty() && cur.has_parent_path()) {
+            if (cur.extension() == ".framework") { frameworkRoot = cur; break; }
+            cur = cur.parent_path();
+        }
+        if (!frameworkRoot.empty()) {
+            fs::path dst = fwDir / frameworkRoot.filename();
+            std::string key = frameworkRoot.filename().string();
+            if (!copiedFrameworks.count(key)) {
+                copiedFrameworks.insert(key);
+                // copy entire framework directory
+                fs::copy(frameworkRoot, dst, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+                if (ec) {
+                    std::cerr << "Warning: failed to copy framework " << frameworkRoot << " -> " << dst << ": " << ec.message() << "\n";
+                }
+            }
+        } else {
+            // regular .dylib
+            fs::path dest = fwDir / lib.filename();
+            if (!copyFileOverwrite(lib, dest)) {
+                std::cerr << "Warning: failed to copy " << lib << " -> " << dest << "\n";
+            }
+        }
+    }
+}
+
+static void copyMainAndPatchMachO(const DeployPlan& plan) {
+    fs::path macOSDir = plan.outputRoot / "Contents" / "MacOS";
+    std::error_code ec;
+    fs::create_directories(macOSDir, ec);
+    fs::path dest = macOSDir / plan.binaryPath.filename();
+    if (!copyFileOverwrite(plan.binaryPath, dest)) {
+        std::cerr << "Warning: failed to copy main binary: " << plan.binaryPath << " -> " << dest << "\n";
+        return;
+    }
+    // Add rpath to Frameworks directory
+    int code = 0;
+    std::string cmd = std::string("llvm-install-name-tool -add_rpath '@executable_path/../Frameworks' ") + shellEscape(dest.string());
+    runCommand(cmd, code);
+    if (code != 0) {
+        std::cerr << "Warning: llvm-install-name-tool failed to add rpath on " << dest << "\n";
+    }
+}
+
+static void copyMainPE(const DeployPlan& plan) {
+    fs::path dest = plan.outputRoot / plan.binaryPath.filename();
+    if (!copyFileOverwrite(plan.binaryPath, dest)) {
+        std::cerr << "Warning: failed to copy main binary: " << plan.binaryPath << " -> " << dest << "\n";
+    }
+}
+
 static void resolveDependenciesPE(const DeployPlan& plan) {
-    resolveAndRecurse(plan);
+    auto libs = resolveAndRecurse(plan);
+    if (!libs.empty()) {
+        std::cout << "Resolved shared libraries (filtered):\n";
+        for (const auto& p : libs) std::cout << "  " << p << "\n";
+    }
+    copyResolvedForPE(plan, libs);
+    copyMainPE(plan);
 }
 
 static void resolveDependenciesELF(const DeployPlan& plan) {
-    resolveAndRecurse(plan);
+    auto libs = resolveAndRecurse(plan);
+    if (!libs.empty()) {
+        std::cout << "Resolved shared libraries (filtered):\n";
+        for (const auto& p : libs) std::cout << "  " << p << "\n";
+    }
+    copyResolvedForELF(plan, libs);
+    copyMainAndPatchELF(plan);
 }
 
 static void resolveDependenciesMachO(const DeployPlan& plan) {
-    resolveAndRecurse(plan);
+    auto libs = resolveAndRecurse(plan);
+    if (!libs.empty()) {
+        std::cout << "Resolved shared libraries (filtered):\n";
+        for (const auto& p : libs) std::cout << "  " << p << "\n";
+    }
+    copyResolvedForMachO(plan, libs);
+    copyMainAndPatchMachO(plan);
 }
 
 int main(int argc, char** argv) {
