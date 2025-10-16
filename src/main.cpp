@@ -2,8 +2,12 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#endif
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -244,6 +248,14 @@ static std::string runCommand(const std::string& cmd, int& exitCode) {
         result.append(buffer.data());
     }
     exitCode = pclose(pipe);
+#if !defined(_WIN32)
+    if (exitCode != -1) {
+        // Decode wait status if available
+        if (WIFEXITED(exitCode)) {
+            exitCode = WEXITSTATUS(exitCode);
+        }
+    }
+#endif
     return result;
 }
 
@@ -308,11 +320,30 @@ struct ResolveContext {
     std::vector<fs::path> searchDirs; // directories used to resolve deps
     std::vector<fs::path> qmlImportPaths; // directories for QML imports
     std::vector<fs::path> cliQmlRoots; // from --qml-root
+    std::unordered_set<std::string> searchDirSet; // for dedup
 };
+
+static char pathListSep() {
+#if defined(_WIN32)
+    return ';';
+#else
+    return ':';
+#endif
+}
+
+static void addSearchDir(ResolveContext& ctx, const fs::path& dir) {
+    if (dir.empty()) return;
+    std::error_code ec;
+    fs::path can = fs::weakly_canonical(dir, ec);
+    const std::string key = (ec ? dir : can).string();
+    if (ctx.searchDirSet.insert(key).second) {
+        ctx.searchDirs.emplace_back(key);
+    }
+}
 
 static void ensureEnvForResolution(ResolveContext& ctx) {
     // Always include binary directory first
-    ctx.searchDirs.push_back(ctx.plan.binaryPath.parent_path());
+    addSearchDir(ctx, ctx.plan.binaryPath.parent_path());
 
     const auto qtLibs = ctx.qt.qtInstallLibs;
     const auto qtBins = ctx.qt.qtInstallBins;
@@ -320,25 +351,25 @@ static void ensureEnvForResolution(ResolveContext& ctx) {
     if (ctx.plan.type == BinaryType::ELF) {
         // LD_LIBRARY_PATH
         std::string ld = getEnv("LD_LIBRARY_PATH");
-        std::vector<std::string> ldv = splitPaths(ld, ':');
-        for (const auto& p : ldv) if (!p.empty()) ctx.searchDirs.emplace_back(p);
-        if (!qtLibs.empty()) ctx.searchDirs.push_back(qtLibs);
+        std::vector<std::string> ldv = splitPaths(ld, pathListSep());
+        for (const auto& p : ldv) if (!p.empty()) addSearchDir(ctx, p);
+        if (!qtLibs.empty()) addSearchDir(ctx, qtLibs);
         // Prepend Qt libs to LD_LIBRARY_PATH for subprocesses
         if (!qtLibs.empty()) {
             std::string newLd = qtLibs.string();
-            if (!ld.empty()) newLd += ":" + ld;
+            if (!ld.empty()) newLd += std::string(1, pathListSep()) + ld;
             setEnv("LD_LIBRARY_PATH", newLd);
         }
     } else if (ctx.plan.type == BinaryType::PE) {
         // PATH search for .dll
         std::string path = getEnv("PATH");
-        std::vector<std::string> pv = splitPaths(path, ':');
-        for (const auto& p : pv) if (!p.empty()) ctx.searchDirs.emplace_back(p);
-        if (!qtBins.empty()) ctx.searchDirs.push_back(qtBins); // MinGW Qt DLLs live in bin
+        std::vector<std::string> pv = splitPaths(path, pathListSep());
+        for (const auto& p : pv) if (!p.empty()) addSearchDir(ctx, p);
+        if (!qtBins.empty()) addSearchDir(ctx, qtBins); // MinGW Qt DLLs live in bin
         // Prepend Qt bins to PATH
         if (!qtBins.empty()) {
             std::string newPath = qtBins.string();
-            if (!path.empty()) newPath += ":" + path;
+            if (!path.empty()) newPath += std::string(1, pathListSep()) + path;
             setEnv("PATH", newPath);
         }
         // Derive QML import paths from MinGW PATH bin entries: ../qml and ../lib/qt-6/qml
@@ -356,17 +387,17 @@ static void ensureEnvForResolution(ResolveContext& ctx) {
     } else {
         // Mach-O: DYLD paths and frameworks
         std::string dyld = getEnv("DYLD_LIBRARY_PATH");
-        for (const auto& p : splitPaths(dyld, ':')) if (!p.empty()) ctx.searchDirs.emplace_back(p);
+        for (const auto& p : splitPaths(dyld, pathListSep())) if (!p.empty()) addSearchDir(ctx, p);
         std::string dyldfw = getEnv("DYLD_FRAMEWORK_PATH");
-        for (const auto& p : splitPaths(dyldfw, ':')) if (!p.empty()) ctx.searchDirs.emplace_back(p);
-        if (!qtLibs.empty()) ctx.searchDirs.push_back(qtLibs);
+        for (const auto& p : splitPaths(dyldfw, pathListSep())) if (!p.empty()) addSearchDir(ctx, p);
+        if (!qtLibs.empty()) addSearchDir(ctx, qtLibs);
         // Prepend Qt libs to DYLD vars for subprocesses
         if (!qtLibs.empty()) {
             std::string newDyld = qtLibs.string();
-            if (!dyld.empty()) newDyld += ":" + dyld;
+            if (!dyld.empty()) newDyld += std::string(1, pathListSep()) + dyld;
             setEnv("DYLD_LIBRARY_PATH", newDyld);
             std::string newDyldFw = qtLibs.string();
-            if (!dyldfw.empty()) newDyldFw += ":" + dyldfw;
+            if (!dyldfw.empty()) newDyldFw += std::string(1, pathListSep()) + dyldfw;
             setEnv("DYLD_FRAMEWORK_PATH", newDyldFw);
         }
     }
@@ -377,7 +408,7 @@ static void ensureEnvForResolution(ResolveContext& ctx) {
         if (fs::exists(ctx.qt.qtInstallQml, ec)) ctx.qmlImportPaths.push_back(ctx.qt.qtInstallQml);
     }
     std::string qml2Env = getEnv("QML2_IMPORT_PATH");
-    for (const auto& p : splitPaths(qml2Env, ':')) {
+    for (const auto& p : splitPaths(qml2Env, pathListSep())) {
         if (p.empty()) continue;
         std::error_code ec;
         if (fs::exists(p, ec)) ctx.qmlImportPaths.emplace_back(p);
@@ -386,14 +417,114 @@ static void ensureEnvForResolution(ResolveContext& ctx) {
     for (const auto& r : ctx.plan.qmlRoots) ctx.cliQmlRoots.push_back(r);
     // Env QML_ROOT may be colon-separated for multiple roots
     std::string envRoots = getEnv("QML_ROOT");
-    for (const auto& p : splitPaths(envRoots, ':')) if (!p.empty()) ctx.cliQmlRoots.emplace_back(p);
+    for (const auto& p : splitPaths(envRoots, pathListSep())) if (!p.empty()) ctx.cliQmlRoots.emplace_back(p);
+}
+
+// --- ELF and Mach-O token expansion helpers ---
+// Forward declaration used by resolve helpers
+static std::optional<fs::path> findLibrary(const std::string& nameOrPath, const ResolveContext& ctx);
+
+static std::string expandElfOrigin(std::string p, const fs::path& subject) {
+    const std::string base = subject.parent_path().string();
+    auto sub = [&](const char* pat){
+        size_t pos = 0;
+        const size_t n = std::strlen(pat);
+        while ((pos = p.find(pat, pos)) != std::string::npos) {
+            p.replace(pos, n, base);
+            pos += base.size();
+        }
+    };
+    sub("${ORIGIN}");
+    sub("$ORIGIN");
+    return p;
+}
+
+struct MachORpaths { std::vector<std::string> rpaths; };
+
+static MachORpaths parseMachORpaths(const fs::path& bin) {
+    MachORpaths r;
+    int code = 0;
+    std::string out = runCommand(std::string("llvm-otool -l ") + shellEscape(bin.string()), code);
+    if (code != 0 || out.empty()) return r;
+    std::istringstream iss(out);
+    std::string line;
+    bool inRpath = false;
+    while (std::getline(iss, line)) {
+        if (line.find("cmd LC_RPATH") != std::string::npos) { inRpath = true; continue; }
+        if (inRpath) {
+            auto pos = line.find("path ");
+            if (pos != std::string::npos) {
+                std::string s = line.substr(pos + 5);
+                auto paren = s.find(" (");
+                if (paren != std::string::npos) s = s.substr(0, paren);
+                // trim
+                while (!s.empty() && (s.back()=='\n' || s.back()=='\r' || s.back()==' ' || s.back()=='\t')) s.pop_back();
+                size_t i=0; while (i<s.size() && (s[i]==' '||s[i]=='\t')) ++i; s = s.substr(i);
+                if (!s.empty()) r.rpaths.push_back(s);
+                inRpath = false;
+            }
+        }
+    }
+    return r;
+}
+
+static fs::path expandMachOToken(const std::string& p, const fs::path& subjectBin, const fs::path& mainExe) {
+    fs::path dir = subjectBin.parent_path();
+    if (p.rfind("@loader_path/", 0) == 0)        return fs::weakly_canonical(dir / p.substr(13));
+    if (p.rfind("@executable_path/", 0) == 0)    return fs::weakly_canonical(mainExe.parent_path() / p.substr(17));
+    return fs::path(p);
+}
+
+// --- Parse result caching (declared later after ParseResult) ---
+
+static std::optional<fs::path> resolveELFRef(const std::string& ref,
+                                             const fs::path& subject,
+                                             const std::vector<std::string>& subjectRpaths,
+                                             const ResolveContext& ctx) {
+    std::error_code ec;
+    fs::path p(ref);
+    if (p.is_absolute() && fs::exists(p, ec)) return fs::weakly_canonical(p, ec);
+    // Try subject rpaths first
+    for (const auto& rp : subjectRpaths) {
+        fs::path base = expandElfOrigin(rp, subject);
+        fs::path cand = base / ref;
+        std::error_code ec2;
+        if (fs::exists(cand, ec2)) return fs::weakly_canonical(cand, ec2);
+    }
+    // Fallback: global search dirs
+    return findLibrary(ref, ctx);
+}
+
+static std::optional<fs::path> resolveMachORef(const std::string& ref,
+                                               const fs::path& subject,
+                                               const std::vector<std::string>& subjectRpaths,
+                                               const ResolveContext& ctx,
+                                               const fs::path& mainExe) {
+    std::error_code ec;
+    fs::path p(ref);
+    if (p.is_absolute() && fs::exists(p, ec)) return fs::weakly_canonical(p, ec);
+    if (ref.rfind("@loader_path/", 0) == 0 || ref.rfind("@executable_path/", 0) == 0) {
+        fs::path cand = expandMachOToken(ref, subject, mainExe);
+        if (fs::exists(cand, ec)) return fs::weakly_canonical(cand, ec);
+    }
+    if (ref.rfind("@rpath/", 0) == 0) {
+        const std::string tail = ref.substr(7);
+        for (const auto& rp : subjectRpaths) {
+            fs::path base = expandMachOToken(rp, subject, mainExe);
+            fs::path cand = base / tail;
+            std::error_code ec2;
+            if (fs::exists(cand, ec2)) return fs::weakly_canonical(cand, ec2);
+        }
+    }
+    // Fallback: global search dirs
+    return findLibrary(ref, ctx);
 }
 
 static bool isQtLibraryName(const std::string& name) {
     // Simple heuristic for Qt 6 libs across platforms
     std::string lower = name;
     std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c){ return std::tolower(c); });
-    return lower.find("qt6") != std::string::npos || lower.rfind("qt", 0) == 0 || lower.find("/qt") != std::string::npos;
+    return lower.find("qt6") != std::string::npos || lower.rfind("qt", 0) == 0;
 }
 
 static bool shouldDeployLibrary(const fs::path& libPath, const std::string& sonameOrDll, BinaryType type, const ResolveContext& ctx) {
@@ -412,7 +543,7 @@ static bool shouldDeployLibrary(const fs::path& libPath, const std::string& sona
         }
         return isQtLibraryName(base) || inQtPath() || dir == ctx.plan.binaryPath.parent_path();
     } else if (type == BinaryType::PE) {
-        std::string lower = base; std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        std::string lower = base; std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c){ return std::tolower(c); });
         static const char* systemPrefixes[] = {"api-ms-win-", "ext-ms-win-"};
         for (auto p : systemPrefixes) { if (lower.rfind(p, 0) == 0) return false; }
         static const char* systemDlls[] = {
@@ -433,12 +564,14 @@ static bool shouldDeployLibrary(const fs::path& libPath, const std::string& sona
 static std::optional<fs::path> findLibrary(const std::string& nameOrPath, const ResolveContext& ctx) {
     fs::path p(nameOrPath);
     // Absolute path resolves directly
-    if (p.is_absolute() && fs::exists(p)) return p;
+    std::error_code ec;
+    if (p.is_absolute() && fs::exists(p, ec)) return fs::weakly_canonical(p, ec);
     // Relative path might include @rpath etc., ignore those here
     // Search in known directories
     for (const auto& dir : ctx.searchDirs) {
         fs::path cand = dir / nameOrPath;
-        if (fs::exists(cand)) return fs::canonical(cand);
+        std::error_code ec2;
+        if (fs::exists(cand, ec2)) return fs::weakly_canonical(cand, ec2);
     }
     return std::nullopt;
 }
@@ -448,10 +581,48 @@ struct ParseResult {
     std::vector<std::string> rpaths;        // for ELF (RPATH/RUNPATH)
 };
 
+// Forward declarations for platform parsers used by cache helpers
+static ParseResult parsePE(const fs::path& bin);
+static ParseResult parseELF(const fs::path& bin);
+static ParseResult parseMachO(const fs::path& bin);
+
+// Now that ParseResult is known, define caching helpers
+struct ParseCache {
+    std::unordered_map<std::string, ParseResult> parseByPath;
+    std::unordered_map<std::string, std::vector<std::string>> machoRpathsByPath;
+};
+
+static std::string canonicalKey(const fs::path& p) {
+    std::error_code ec;
+    fs::path c = fs::weakly_canonical(p, ec);
+    return (ec ? p : c).string();
+}
+
+static const ParseResult& parseDepsCached(const fs::path& subject, BinaryType type, ParseCache& cache) {
+    const std::string key = canonicalKey(subject);
+    auto it = cache.parseByPath.find(key);
+    if (it != cache.parseByPath.end()) return it->second;
+    ParseResult pr;
+    if (type == BinaryType::ELF) pr = parseELF(subject);
+    else if (type == BinaryType::PE) pr = parsePE(subject);
+    else pr = parseMachO(subject);
+    auto [insIt, _] = cache.parseByPath.emplace(key, std::move(pr));
+    return insIt->second;
+}
+
+static const std::vector<std::string>& machoRpathsFor(const fs::path& subject, ParseCache& cache) {
+    const std::string key = canonicalKey(subject);
+    auto it = cache.machoRpathsByPath.find(key);
+    if (it != cache.machoRpathsByPath.end()) return it->second;
+    auto r = parseMachORpaths(subject);
+    auto [insIt, _] = cache.machoRpathsByPath.emplace(key, std::move(r.rpaths));
+    return insIt->second;
+}
+
 static ParseResult parsePE(const fs::path& bin) {
     ParseResult r;
     int code = 0;
-    std::string out = runCommand("x86_64-w64-mingw32-objdump -p '" + bin.string() + "'", code);
+    std::string out = runCommand("x86_64-w64-mingw32-objdump -p " + shellEscape(bin.string()), code);
     if (code != 0) return r;
     std::istringstream iss(out);
     std::string line;
@@ -473,7 +644,7 @@ static ParseResult parsePE(const fs::path& bin) {
 static ParseResult parseELF(const fs::path& bin) {
     ParseResult r;
     int code = 0;
-    std::string out = runCommand("objdump -p '" + bin.string() + "'", code);
+    std::string out = runCommand("objdump -p " + shellEscape(bin.string()), code);
     if (code != 0) return r;
     std::istringstream iss(out);
     std::string line;
@@ -512,7 +683,7 @@ static ParseResult parseELF(const fs::path& bin) {
 
 static std::optional<std::string> queryElfSoname(const fs::path& soPath) {
     int code = 0;
-    std::string out = runCommand("objdump -p '" + soPath.string() + "'", code);
+    std::string out = runCommand("objdump -p " + shellEscape(soPath.string()), code);
     if (code != 0) return std::nullopt;
     std::istringstream iss(out);
     std::string line;
@@ -533,7 +704,7 @@ static std::optional<std::string> queryElfSoname(const fs::path& soPath) {
 static ParseResult parseMachO(const fs::path& bin) {
     ParseResult r;
     int code = 0;
-    std::string out = runCommand("llvm-otool -L '" + bin.string() + "'", code);
+    std::string out = runCommand("llvm-otool -L " + shellEscape(bin.string()), code);
     if (code != 0) return r;
     std::istringstream iss(out);
     std::string line;
@@ -554,30 +725,29 @@ static ParseResult parseMachO(const fs::path& bin) {
 }
 
 static std::vector<fs::path> resolveAndRecurse(const DeployPlan& plan) {
-    ResolveContext ctx{plan, queryQtPaths(), {}};
+    ResolveContext ctx{plan, queryQtPaths(), {}, {}, {}, {}};
     ensureEnvForResolution(ctx);
 
-    // For ELF: include RPATH/RUNPATH from the main binary
-    ParseResult pr;
-    if (plan.type == BinaryType::ELF) {
-        pr = parseELF(plan.binaryPath);
-        for (const auto& rpath : pr.rpaths) ctx.searchDirs.emplace_back(rpath);
-    } else if (plan.type == BinaryType::PE) {
-        pr = parsePE(plan.binaryPath);
-    } else {
-        pr = parseMachO(plan.binaryPath);
-    }
+    // Parse initial dependencies (per-platform) with cache
+    ParseCache cache;
+    const ParseResult& pr = parseDepsCached(plan.binaryPath, plan.type, cache);
 
     std::vector<fs::path> stack;
     std::vector<std::string> initial = pr.dependencies;
     for (const auto& dep : initial) {
-        auto found = findLibrary(dep, ctx);
-        if (found) stack.push_back(*found);
-        else {
-            // If it's a system lib we skip silently; otherwise error
-            if (isQtLibraryName(dep)) {
-                throw std::runtime_error("Required Qt library not found in search paths: " + dep);
-            }
+        std::optional<fs::path> found;
+        if (plan.type == BinaryType::ELF) {
+            found = resolveELFRef(dep, plan.binaryPath, pr.rpaths, ctx);
+        } else if (plan.type == BinaryType::PE) {
+            found = findLibrary(dep, ctx);
+        } else {
+            const auto& rps = machoRpathsFor(plan.binaryPath, cache);
+            found = resolveMachORef(dep, plan.binaryPath, rps, ctx, plan.binaryPath);
+        }
+        if (found) {
+            if (shouldDeployLibrary(*found, dep, plan.type, ctx)) stack.push_back(*found);
+        } else if (isQtLibraryName(dep)) {
+            throw std::runtime_error("Required Qt library not found in search paths: " + dep);
         }
     }
 
@@ -592,19 +762,19 @@ static std::vector<fs::path> resolveAndRecurse(const DeployPlan& plan) {
         if (visited.count(key)) continue;
         visited.insert(key);
 
-        ParseResult prChild;
-        if (plan.type == BinaryType::ELF) {
-            prChild = parseELF(cur);
-            for (const auto& rp : prChild.rpaths) ctx.searchDirs.emplace_back(rp);
-        } else if (plan.type == BinaryType::PE) {
-            prChild = parsePE(cur);
-        } else {
-            prChild = parseMachO(cur);
-        }
+        const ParseResult& prChild = parseDepsCached(cur, plan.type, cache);
 
         for (const auto& dep : prChild.dependencies) {
             if (isVerbose()) std::cout << "[resolve]   dep: " << dep << "\n";
-            auto found = findLibrary(dep, ctx);
+            std::optional<fs::path> found;
+            if (plan.type == BinaryType::ELF) {
+                found = resolveELFRef(dep, cur, prChild.rpaths, ctx);
+            } else if (plan.type == BinaryType::PE) {
+                found = findLibrary(dep, ctx);
+            } else {
+                const auto& rps = machoRpathsFor(cur, cache);
+                found = resolveMachORef(dep, cur, rps, ctx, plan.binaryPath);
+            }
             if (found) {
                 if (shouldDeployLibrary(*found, dep, plan.type, ctx)) {
                     if (isVerbose()) std::cout << "[resolve]     push: " << *found << "\n";
@@ -739,7 +909,7 @@ static void copyPluginsPE(const ResolveContext& ctx, const DeployPlan& plan, con
     // Derive from resolved Qt6Core.dll location(s)
     for (const auto& lib : resolvedLibs) {
         std::string base = lib.filename().string();
-        std::string lower = base; std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        std::string lower = base; std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c){ return std::tolower(c); });
         if (lower == "qt6core.dll") {
             fs::path binDir = lib.parent_path();
             std::error_code ec;
@@ -833,15 +1003,7 @@ static void copyMainAndPatchELF(const DeployPlan& plan) {
     }
 }
 
-static fs::path findFrameworkRoot(const fs::path& binaryInsideFramework) {
-    fs::path p = binaryInsideFramework;
-    // climb up until a parent ending with .framework
-    while (!p.empty() && p.has_parent_path()) {
-        if (p.extension() == ".framework") return p;
-        p = p.parent_path();
-    }
-    return {};
-}
+// (removed unused findFrameworkRoot)
 
 static void copyResolvedForMachO(const DeployPlan& plan, const std::vector<fs::path>& libs) {
     fs::path fwDir = plan.outputRoot / "Contents" / "Frameworks";
@@ -1096,7 +1258,7 @@ static void resolveQmlPluginDependencies(const DeployPlan& plan) {
     auto qmlLibs = listQmlPluginLibraries(plan);
     if (qmlLibs.empty()) return;
 
-    ResolveContext ctx{plan, queryQtPaths(), {}};
+    ResolveContext ctx{plan, queryQtPaths(), {}, {}, {}, {}};
     ensureEnvForResolution(ctx);
 
     // Seed stack with plugin libs
@@ -1117,19 +1279,20 @@ static void resolveQmlPluginDependencies(const DeployPlan& plan) {
         if (visited.count(key)) continue;
         visited.insert(key);
 
-        ParseResult prChild;
-        if (plan.type == BinaryType::ELF) {
-            prChild = parseELF(cur);
-            for (const auto& rp : prChild.rpaths) ctx.searchDirs.emplace_back(rp);
-        } else if (plan.type == BinaryType::PE) {
-            prChild = parsePE(cur);
-        } else {
-            prChild = parseMachO(cur);
-        }
+        static ParseCache cache; // local cache per run
+        const ParseResult& prChild = parseDepsCached(cur, plan.type, cache);
 
         for (const auto& dep : prChild.dependencies) {
             if (isVerbose()) std::cout << "[qml-deps]   dep: " << dep << "\n";
-            auto found = findLibrary(dep, ctx);
+            std::optional<fs::path> found;
+            if (plan.type == BinaryType::ELF) {
+                found = resolveELFRef(dep, cur, prChild.rpaths, ctx);
+            } else if (plan.type == BinaryType::PE) {
+                found = findLibrary(dep, ctx);
+            } else {
+                const auto& rps = machoRpathsFor(cur, cache);
+                found = resolveMachORef(dep, cur, rps, ctx, plan.binaryPath);
+            }
             if (found) {
                 // We want to deploy library dependencies (not the plugin lib itself)
                 if (shouldDeployLibrary(*found, dep, plan.type, ctx)) {
@@ -1177,6 +1340,7 @@ static std::pair<std::optional<std::string>, std::vector<std::string>> parseOtoo
     std::istringstream iss(out);
     std::string line;
     bool first = true;
+    bool tookId = false;
     while (std::getline(iss, line)) {
         if (first) { first = false; continue; }
         size_t start = 0; while (start < line.size() && std::isspace(static_cast<unsigned char>(line[start]))) ++start;
@@ -1184,7 +1348,7 @@ static std::pair<std::optional<std::string>, std::vector<std::string>> parseOtoo
         while (end < line.size() && !std::isspace(static_cast<unsigned char>(line[end])) && line[end] != '(') ++end;
         if (end <= start) continue;
         std::string token = line.substr(start, end - start);
-        if (!id.has_value()) id = token; // install id appears first for dylibs
+        if (!tookId) { id = token; tookId = true; continue; }
         deps.push_back(token);
     }
     return {id, deps};
@@ -1439,7 +1603,7 @@ static void resolveDependenciesPE(const DeployPlan& plan) {
     copyResolvedForPE(plan, libs);
     copyMainPE(plan);
     // Copy a minimal plugin set
-    ResolveContext ctx{plan, queryQtPaths(), {}};
+    ResolveContext ctx{plan, queryQtPaths(), {}, {}, {}, {}};
     // pass CLI qml roots
     // Pull from Args by re-parsing? Instead, read from env QML_ROOT only; simple workaround:
     // We'll allow users to pass multiple --qml-root via setting QML_ROOT as colon-separated as well.
@@ -1458,7 +1622,7 @@ static void resolveDependenciesELF(const DeployPlan& plan) {
     }
     copyResolvedForELF(plan, libs);
     copyMainAndPatchELF(plan);
-    ResolveContext ctx{plan, queryQtPaths(), {}};
+    ResolveContext ctx{plan, queryQtPaths(), {}, {}, {}, {}};
     ensureEnvForResolution(ctx);
     copyPluginsELF(ctx, plan);
     copyQmlModules(ctx, plan);
@@ -1474,7 +1638,7 @@ static void resolveDependenciesMachO(const DeployPlan& plan) {
     }
     copyResolvedForMachO(plan, libs);
     copyMainAndPatchMachO(plan);
-    ResolveContext ctx{plan, queryQtPaths(), {}};
+    ResolveContext ctx{plan, queryQtPaths(), {}, {}, {}, {}};
     ensureEnvForResolution(ctx);
     copyPluginsMachO(ctx, plan);
     copyQmlModules(ctx, plan);
