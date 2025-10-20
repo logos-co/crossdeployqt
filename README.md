@@ -24,7 +24,7 @@ $ crossdeployqt --bin <PATH TO>/foo.app/Contents/MacOS/bar --out ./dist-macos/
 
 Under Nix `crossdeployqt` is wrapped with all tools required for operation on PATH: `qtpaths`, `qmlimportscanner`, `lconvert`, `objdump`, `patchelf`, `x86_64-w64-mingw32-objdump`, `llvm-otool`, `llvm-install-name-tool`, and `find`.
 
-`$ nix run github:logos-co/crossdeployqt` 
+`$ nix run github:logos-co/crossdeployqt -- --help` 
 
 or 
 
