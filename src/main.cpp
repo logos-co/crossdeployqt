@@ -582,11 +582,11 @@ static bool shouldDeployLibrary(const fs::path& libPath, const std::string& sona
         std::string lower = base; std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c){ return std::tolower(c); });
         static const char* systemPrefixes[] = {"api-ms-win-", "ext-ms-win-"};
         for (auto p : systemPrefixes) { if (lower.rfind(p, 0) == 0) return false; }
-        static const char* systemDlls[] = {
+        static const std::unordered_set<std::string> systemDlls = {
             "kernel32.dll","user32.dll","gdi32.dll","shell32.dll","ole32.dll","advapi32.dll","ws2_32.dll",
             "ntdll.dll","sechost.dll","shlwapi.dll","comdlg32.dll","imm32.dll","version.dll","winmm.dll","cfgmgr32.dll"
         };
-        for (auto d : systemDlls) if (lower == d) return false;
+        if (systemDlls.count(lower)) return false;
         // Include if path is within Nix store (cross env), Qt-ish, in Qt path, or alongside binary
         const bool inNixStore = libPath.string().rfind("/nix/store/", 0) == 0;
         return inNixStore || isQtLibraryName(base) || inQtPath() || dir == ctx.plan.binaryPath.parent_path();
@@ -944,10 +944,10 @@ static void copyPluginsPE(const ResolveContext& ctx, const DeployPlan& plan, con
     if (!ctx.qt.qtInstallPlugins.empty()) pluginRoots.push_back(ctx.qt.qtInstallPlugins);
     // From env MINGW_QT_PLUGINS (colon-separated)
     std::string mingwPlugins = getEnv("MINGW_QT_PLUGINS");
-    for (const auto& p : splitPaths(mingwPlugins, ':')) if (!p.empty()) pluginRoots.emplace_back(p);
+    for (const auto& p : splitPaths(mingwPlugins, pathListSep())) if (!p.empty()) pluginRoots.emplace_back(p);
     // Derive from PATH entries that end with /bin → ../plugins
     std::string path = getEnv("PATH");
-    for (const auto& p : splitPaths(path, ':')) {
+    for (const auto& p : splitPaths(path, pathListSep())) {
         if (p.size() > 4 && p.rfind("/bin", p.size() - 4) != std::string::npos) {
             fs::path base = fs::path(p).parent_path();
             std::error_code ec;
@@ -1249,24 +1249,59 @@ static void copyQmlModules(const ResolveContext& ctx, const DeployPlan& plan) {
         ec.clear();
         // Copy recursively
         try {
-            // Prefer copying files first, skipping symlinks for speed and to avoid re-traversal via links
             for (auto it = fs::recursive_directory_iterator(m.sourcePath, fs::directory_options::skip_permission_denied, ec);
                  it != fs::recursive_directory_iterator(); ++it) {
                 if (it->is_directory(ec)) continue;
-                if (it->is_symlink(ec)) continue;
-                fs::path rel = fs::relative(it->path(), m.sourcePath, ec);
+
+                fs::path src = it->path();
+                fs::path rel = fs::relative(src, m.sourcePath, ec);
                 fs::path out = dst / rel;
-                copyFileOverwrite(it->path(), out);
-                if (plan.type == BinaryType::MACHO && out.extension() == ".dylib") {
-                    // Move dylib to PlugIns/quick and leave a symlink
-                    fs::path quickDir = plan.outputRoot / "Contents" / "PlugIns" / "quick";
-                    fs::create_directories(quickDir, ec);
-                    fs::path moved = quickDir / out.filename();
-                    if (isVerbose()) std::cout << "[qml] move dylib: " << out << " -> " << moved << "\n";
-                    copyFileOverwrite(out, moved);
-                    std::error_code sec;
-                    fs::remove(out, sec);
-                    try { fs::create_symlink(fs::relative(moved, out.parent_path()), out); } catch (...) {}
+
+                if (plan.type == BinaryType::MACHO) {
+                    // For macOS, if the entry (or its symlink target) is a dylib, place the real file in PlugIns/quick
+                    std::error_code isSymlinkEc;
+                    const bool isLink = it->is_symlink(isSymlinkEc);
+                    fs::path target = src;
+                    if (isLink) {
+                        std::error_code le;
+                        fs::path linkTarget = fs::read_symlink(src, le);
+                        if (!le) {
+                            std::error_code wc;
+                            fs::path absTarget = fs::weakly_canonical(src.parent_path() / linkTarget, wc);
+                            if (!wc) target = absTarget;
+                        }
+                    }
+                    if (target.extension() == ".dylib") {
+                        fs::path quickDir = plan.outputRoot / "Contents" / "PlugIns" / "quick";
+                        fs::create_directories(quickDir, ec);
+                        fs::path moved = quickDir / target.filename();
+                        if (isVerbose()) std::cout << "[qml] stage dylib: " << target << " -> " << moved << "\n";
+                        if (!copyFileOverwrite(target, moved)) {
+                            throw std::runtime_error(std::string("Failed to copy QML plugin dylib: ") + target.string());
+                        }
+                        // Ensure parent dirs for the symlink location inside qml tree
+                        std::error_code mkEc;
+                        fs::create_directories(out.parent_path(), mkEc);
+                        // Replace any existing file at 'out' with a symlink to moved; fallback to copying if symlink creation fails
+                        std::error_code rmEc;
+                        fs::remove(out, rmEc);
+                        try {
+                            fs::create_symlink(fs::relative(moved, out.parent_path()), out);
+                        } catch (...) {
+                            copyFileOverwrite(moved, out);
+                        }
+                        continue;
+                    }
+                    // Non-dylib symlinks: skip to avoid copying dangling or redundant links
+                    if (isLink) continue;
+                } else {
+                    // Non-macOS: skip symlinks for safety
+                    std::error_code isLinkEc2;
+                    if (it->is_symlink(isLinkEc2)) continue;
+                }
+
+                if (!copyFileOverwrite(src, out)) {
+                    throw std::runtime_error(std::string("Failed to copy QML file: ") + src.string());
                 }
             }
         } catch (...) {
