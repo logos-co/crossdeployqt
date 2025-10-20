@@ -70,6 +70,7 @@
               pkgs.qt6.qtdeclarative        # qmlimportscanner (in libexec), QML2_IMPORT_PATH root
               pkgs.qt6.qttools              # lconvert
               pkgs.llvmPackages.llvm        # llvm-otool, llvm-install-name-tool
+              pkgs.findutils                # find used for patchelf pass on plugins
             ] ++ linuxExtraTools;
             mingwPaths = lib.optionalString isLinux ( # macOS complains about somethign upstream
               ":${mingw.qt6.qtbase}/bin"
@@ -89,6 +90,7 @@
               "${pkgs.qt6.qttools}/bin"            # lconvert
               "${pkgs.llvmPackages.llvm}/bin"      # llvm-otool, llvm-install-name-tool
               "${pkgs.binutils}/bin"               # objdump
+              "${pkgs.findutils}/bin"              # find
             ]
             ++ lib.optionals isLinux [
               "${pkgs.patchelf}/bin"               # patchelf
@@ -136,6 +138,7 @@
                 maintainers = [ ];
               };
             };
+            crossdeployqt = self.packages.${system}.default;
           };
 
         apps = {
@@ -178,9 +181,9 @@ ${mingw.openssl}/bin"
             + ''
               echo "cmake -S . -B build"
               echo "cmake --build build -j"
-              echo "./build/crossdeployqt --bin ~/experiments/logos-app/build-windows/bin/logos.exe --out ./dist-win/"
-              echo "./build/crossdeployqt --bin ~/experiments/logos-app/build/bin/logos --out ./dist-linux/"
-              echo "./build/crossdeployqt --bin ~/experiments/logos-app/build-macos/bin/logos.app/Contents/MacOS/logos --out ./dist-macos/"
+              echo "./build/crossdeployqt --bin <PATH TO>/foo.exe --out ./dist-win/"
+              echo "./build/crossdeployqt --bin <PATH TO>/foo --out ./dist-linux/"
+              echo "./build/crossdeployqt --bin <PATH TO>/foo.app/Contents/MacOS/bar --out ./dist-macos/"
             '';
           };
         };
