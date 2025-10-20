@@ -55,6 +55,95 @@
            
       in
       {
+        packages =
+          let
+            pname = "crossdeployqt";
+            version = (self.rev or "dev");
+            linuxExtraTools = lib.optionals isLinux [
+              pkgs.patchelf
+              pkgs.pkgsCross.mingwW64.buildPackages.binutils # x86_64-w64-mingw32-objdump
+            ];
+            # Tools needed by the program at runtime
+            runtimeTools = [
+              pkgs.binutils                 # objdump
+              pkgs.qt6.qtbase               # qtpaths, QT_PLUGIN_PATH root
+              pkgs.qt6.qtdeclarative        # qmlimportscanner (in libexec), QML2_IMPORT_PATH root
+              pkgs.qt6.qttools              # lconvert
+              pkgs.llvmPackages.llvm        # llvm-otool, llvm-install-name-tool
+            ] ++ linuxExtraTools;
+            mingwPaths = lib.optionalString isLinux ( # macOS complains about somethign upstream
+              ":${mingw.qt6.qtbase}/bin"
+              + ":${mingw.qt6.qtdeclarative}/bin"
+              + ":${mingw.stdenv.cc.cc.lib}/${windowsTriple}/lib"
+              + ":${mingw.windows.pthreads}/bin"
+              + ":${mingw.zlib}/bin"
+              + ":${mingw.pcre2}/bin"
+              + ":${mingw.zstd}/bin"
+              + ":${mingw.libb2}/bin"
+              + ":${mingw.double-conversion}/bin"
+              + ":${mingw.libpng}/bin"
+              + ":${mingw.openssl}/bin"
+            );
+            wrapPath = lib.concatStringsSep ":" ([
+              "${pkgs.qt6.qtdeclarative}/libexec"  # qmlimportscanner
+              "${pkgs.qt6.qttools}/bin"            # lconvert
+              "${pkgs.llvmPackages.llvm}/bin"      # llvm-otool, llvm-install-name-tool
+              "${pkgs.binutils}/bin"               # objdump
+            ]
+            ++ lib.optionals isLinux [
+              "${pkgs.patchelf}/bin"               # patchelf
+              "${pkgs.pkgsCross.mingwW64.buildPackages.binutils}/bin" # x86_64-w64-mingw32-objdump
+            ]);
+          in
+          {
+            default = pkgs.stdenv.mkDerivation {
+              inherit pname version;
+              src = self;
+
+              nativeBuildInputs = [
+                pkgs.cmake
+                pkgs.ninja
+                pkgs.pkg-config
+                pkgs.makeWrapper
+              ];
+
+              buildInputs = [ ];
+
+              # Use an out-of-source Ninja build and install the single binary
+              configurePhase = ''
+                cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+              '';
+              buildPhase = ''
+                cmake --build build -j$NIX_BUILD_CORES
+              '';
+              installPhase = ''
+                install -Dm755 build/crossdeployqt "$out/bin/crossdeployqt"
+                # Wrap to provide required tools and helpful env defaults
+                wrapProgram "$out/bin/crossdeployqt" \
+                  --set QTPATHS_BIN "${pkgs.qt6.qtbase}/bin/qtpaths" \
+                  --set QT_PLUGIN_PATH "${pkgs.qt6.qtbase}/lib/qt-6/plugins" \
+                  --set QML2_IMPORT_PATH "${pkgs.qt6.qtdeclarative}/lib/qt-6/qml" \
+                  --prefix PATH : "${wrapPath}${mingwPaths}"
+              '';
+
+              # Keep runtime tool deps in the closure by referencing them
+              passthru.runtimeTools = runtimeTools;
+              meta = with lib; {
+                description = "Collect dependencies and assets for Qt 6 apps (Linux/macOS/Windows)";
+                homepage = "https://github.com/logos-co/crossdeployqt";
+                license = licenses.mit;
+                platforms = platforms.unix;
+                maintainers = [ ];
+              };
+            };
+          };
+
+        apps = {
+          default = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/crossdeployqt";
+          };
+        };
 
         devShells = {
           default = pkgs.mkShell {
