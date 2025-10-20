@@ -34,13 +34,14 @@ struct Args {
     fs::path outDir;
     std::vector<fs::path> qmlRoots;
     std::vector<std::string> languages;
+    std::vector<fs::path> overlays; // optional overlay roots to merge into output
 };
 
 // Forward declaration for helper used in parseArgs
 static std::vector<std::string> splitPaths(const std::string& s, char sep);
 
 static void printUsage(const char* argv0) {
-    std::cerr << "Usage: " << argv0 << " --bin <path-to-binary> --out <output-dir> [--qml-root <dir>]... [--languages <lang[,lang...>]>\n";
+    std::cerr << "Usage: " << argv0 << " --bin <path-to-binary> --out <output-dir> [--qml-root <dir>]... [--languages <lang[,lang...>]> [--overlay <dir>]...\n";
 }
 
 static std::optional<Args> parseArgs(int argc, char** argv) {
@@ -58,6 +59,8 @@ static std::optional<Args> parseArgs(int argc, char** argv) {
             for (const auto& item : splitPaths(langs, ',')) {
                 if (!item.empty()) args.languages.push_back(item);
             }
+        } else if (a == "--overlay" && i + 1 < argc) {
+            args.overlays.emplace_back(argv[++i]);
         } else if (a == "-h" || a == "--help") {
             printUsage(argv[0]);
             return std::nullopt;
@@ -206,6 +209,7 @@ struct DeployPlan {
     fs::path outputRoot;
     std::vector<fs::path> qmlRoots; // optional CLI-provided QML roots
     std::vector<std::string> languages; // optional languages
+    std::vector<fs::path> overlays; // optional overlay roots
 };
 
 static std::string getEnv(const char* key) {
@@ -902,6 +906,71 @@ static bool copyFileOverwrite(const fs::path& from, const fs::path& to) {
     std::error_code pec;
     fs::permissions(to, fs::perms::owner_write, fs::perm_options::add, pec);
     return ok;
+}
+
+// Recursively merge one directory tree into another. Creates directories as needed,
+// overwrites files, recreates symlinks where possible (falls back to copying target).
+static void mergeDirectoryTree(const fs::path& srcRoot, const fs::path& dstRoot) {
+    std::error_code ec;
+    if (srcRoot.empty() || dstRoot.empty()) return;
+    if (!fs::exists(srcRoot, ec) || !fs::is_directory(srcRoot, ec)) return;
+    for (auto it = fs::recursive_directory_iterator(srcRoot, fs::directory_options::skip_permission_denied, ec);
+         it != fs::recursive_directory_iterator(); ++it) {
+        const fs::path src = it->path();
+        std::error_code rec;
+        fs::path rel = fs::relative(src, srcRoot, rec);
+        if (rec) rel = src.filename();
+        fs::path dst = dstRoot / rel;
+        if (it->is_directory(ec)) {
+            std::error_code mk;
+            fs::create_directories(dst, mk);
+            continue;
+        }
+        // Ensure parent exists
+        {
+            std::error_code mk;
+            fs::create_directories(dst.parent_path(), mk);
+        }
+        // Handle symlinks explicitly to preserve them when possible
+        std::error_code isLinkEc;
+        const bool isLink = it->is_symlink(isLinkEc);
+        if (isLink && !isLinkEc) {
+            std::error_code rm;
+            fs::remove(dst, rm);
+            std::error_code le;
+            fs::path target = fs::read_symlink(src, le);
+            if (!le) {
+                try {
+                    fs::create_symlink(target, dst);
+                    continue;
+                } catch (...) {
+                    // Fall through to copy the resolved target contents
+                }
+                std::error_code absEc;
+                fs::path absTarget = fs::weakly_canonical(src.parent_path() / target, absEc);
+                if (!absEc && fs::is_regular_file(absTarget)) {
+                    copyFileOverwrite(absTarget, dst);
+                    continue;
+                }
+            }
+            // If we couldn't read or replicate the link, skip to avoid creating broken files
+            continue;
+        }
+        // Regular file
+        if (it->is_regular_file(ec)) {
+            copyFileOverwrite(src, dst);
+        }
+    }
+}
+
+static void applyOverlays(const DeployPlan& plan) {
+    for (const auto& ov : plan.overlays) {
+        if (ov.empty()) continue;
+        std::error_code ec;
+        if (!fs::exists(ov, ec) || !fs::is_directory(ov, ec)) continue;
+        if (isVerbose()) std::cout << "[overlay] merge " << ov << " -> " << plan.outputRoot << "\n";
+        mergeDirectoryTree(ov, plan.outputRoot);
+    }
 }
 
 static void writeQtConfIfNeeded(const DeployPlan& plan) {
@@ -1801,6 +1870,8 @@ static void resolveDependenciesPE(const DeployPlan& plan) {
     }
     copyResolvedForPE(plan, libs);
     copyMainPE(plan);
+    // Apply overlays after core files so user assets can override
+    applyOverlays(plan);
     // Try to patch Qt6Core.dll prefix/infix paths in-place (relocatability)
     for (const auto& p : libs) {
         std::string base = p.filename().string();
@@ -1844,6 +1915,10 @@ static void resolveDependenciesELF(const DeployPlan& plan) {
     copyPluginsELF(ctx, plan);
     copyQmlModules(ctx, plan);
     deployTranslations(ctx, plan);
+    // Apply overlays late so that user files can override generated content
+    applyOverlays(plan);
+    // Re-patch plugin rpaths in case overlays added additional plugins
+    copyPluginsELF(ctx, plan);
     resolveQmlPluginDependencies(plan);
 }
 
@@ -1860,6 +1935,8 @@ static void resolveDependenciesMachO(const DeployPlan& plan) {
     copyPluginsMachO(ctx, plan);
     copyQmlModules(ctx, plan);
     deployTranslations(ctx, plan);
+    // Apply overlays before final fixups so fixInstallNames can adjust any new libs
+    applyOverlays(plan);
     resolveQmlPluginDependencies(plan);
     // Ensure rpaths and install names are correct for app, frameworks, and plugins
     fixInstallNamesMachO(plan);
@@ -1890,7 +1967,7 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        DeployPlan plan{*maybeType, args.binaryPath, args.outDir, args.qmlRoots, args.languages};
+        DeployPlan plan{*maybeType, args.binaryPath, args.outDir, args.qmlRoots, args.languages, args.overlays};
         std::cout << "Detected: " << toString(plan.type) << "\n";
 
         // Verify external tool availability for this platform
