@@ -274,6 +274,42 @@ static std::string shellEscape(const std::string& s) {
     return out;
 }
 
+static bool programOnPath(const std::string& name) {
+    int code = 0;
+    runCommand(std::string("command -v ") + name + " >/dev/null 2>&1", code);
+    return code == 0;
+}
+
+static bool fileExistsExecutable(const fs::path& p) {
+    if (p.empty()) return false;
+    std::error_code ec;
+    auto st = fs::status(p, ec);
+    if (ec) return false;
+    return fs::is_regular_file(st) || fs::is_symlink(st);
+}
+
+static std::vector<std::string> computeMissingTools(BinaryType type) {
+    std::vector<std::string> missing;
+    // qtpaths (allow override)
+    std::string qtpathsBin = getEnv("QTPATHS_BIN");
+    bool haveQtpaths = !qtpathsBin.empty() ? fileExistsExecutable(qtpathsBin) : programOnPath("qtpaths");
+    if (!haveQtpaths) missing.push_back(qtpathsBin.empty() ? std::string("qtpaths") : (qtpathsBin + " (from QTPATHS_BIN)"));
+    // common tools
+    if (!programOnPath("qmlimportscanner")) missing.push_back("qmlimportscanner");
+    if (!programOnPath("lconvert")) missing.push_back("lconvert");
+    // per-platform
+    if (type == BinaryType::ELF) {
+        if (!programOnPath("objdump")) missing.push_back("objdump");
+        if (!programOnPath("patchelf")) missing.push_back("patchelf");
+    } else if (type == BinaryType::PE) {
+        if (!programOnPath("x86_64-w64-mingw32-objdump")) missing.push_back("x86_64-w64-mingw32-objdump");
+    } else { // Mach-O
+        if (!programOnPath("llvm-otool")) missing.push_back("llvm-otool");
+        if (!programOnPath("llvm-install-name-tool")) missing.push_back("llvm-install-name-tool");
+    }
+    return missing;
+}
+
 struct QtPathsInfo {
     fs::path qtInstallLibs;
     fs::path qtInstallBins;
@@ -817,6 +853,7 @@ static void ensureOutputLayout(const DeployPlan& plan) {
             break;
         }
         case BinaryType::ELF: {
+            fs::create_directories(plan.outputRoot / "bin", ec);
             fs::create_directories(plan.outputRoot / "plugins", ec);
             fs::create_directories(plan.outputRoot / "plugins" / "platforms", ec);
             fs::create_directories(plan.outputRoot / "plugins" / "imageformats", ec);
@@ -861,19 +898,34 @@ static bool copyFileOverwrite(const fs::path& from, const fs::path& to) {
     }
     bool ok = fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
     if (!ok && isVerbose()) std::cout << "[copy-fail] " << from << " -> " << to << ": " << ec.message() << "\n";
+    // Ensure destination is owner-writable so we can patch rpaths later
+    std::error_code pec;
+    fs::permissions(to, fs::perms::owner_write, fs::perm_options::add, pec);
     return ok;
 }
 
 static void writeQtConfIfNeeded(const DeployPlan& plan) {
     if (plan.type == BinaryType::MACHO) return;
-    fs::path conf = plan.outputRoot / "qt.conf";
+    fs::path conf;
+    if (plan.type == BinaryType::ELF) {
+        conf = plan.outputRoot / "bin" / "qt.conf";
+    } else {
+        conf = plan.outputRoot / "qt.conf";
+    }
     std::ofstream ofs(conf);
     if (!ofs) return;
     ofs << "[Paths]\n";
-    ofs << "Prefix=." << "\n";
-    ofs << "Plugins=plugins" << "\n";
-    ofs << "Qml2Imports=qml" << "\n";
-    ofs << "Translations=translations" << "\n";
+    if (plan.type == BinaryType::ELF) {
+        ofs << "Prefix=.." << "\n";
+        ofs << "Plugins=../plugins" << "\n";
+        ofs << "Qml2Imports=../qml" << "\n";
+        ofs << "Translations=../translations" << "\n";
+    } else {
+        ofs << "Prefix=." << "\n";
+        ofs << "Plugins=plugins" << "\n";
+        ofs << "Qml2Imports=qml" << "\n";
+        ofs << "Translations=translations" << "\n";
+    }
 }
 
 static void copyResolvedForPE(const DeployPlan& plan, const std::vector<fs::path>& libs) {
@@ -948,8 +1000,11 @@ static void copyResolvedForELF(const DeployPlan& plan, const std::vector<fs::pat
             std::cerr << "Warning: failed to copy " << lib << " -> " << dest << "\n";
             continue;
         }
+        // Ensure we can patch the library
+        std::error_code ecPerm;
+        fs::permissions(dest, fs::perms::owner_write, fs::perm_options::add, ecPerm);
         // Create SONAME symlink if needed (e.g., libFoo.so.6 -> libFoo.so.6.X.Y)
-        auto soname = queryElfSoname(lib);
+        auto soname = queryElfSoname(dest);
         if (soname) {
             const std::string destName = dest.filename().string();
             if (*soname != destName) {
@@ -980,23 +1035,23 @@ static void copyPluginsELF(const ResolveContext& ctx, const DeployPlan& plan) {
         fs::path p = src / "imageformats" / name;
         if (fs::exists(p)) copyFileOverwrite(p, plan.outputRoot / "plugins" / "imageformats" / p.filename());
     }
-    // Set RUNPATH on plugins to $ORIGIN/../lib
+    // Set RUNPATH on plugins to $ORIGIN/../../lib (plugins/* are typically two levels deep), forcing RPATH
     int code = 0;
     std::string pluginsDir = (plan.outputRoot / "plugins").string();
-    std::string cmd = std::string("find ") + shellEscape(pluginsDir) + " -type f -name '*.so*' -exec patchelf --set-rpath '$ORIGIN/../lib' {} +";
+    std::string cmd = std::string("find ") + shellEscape(pluginsDir) + " -type f -name '*.so*' -exec patchelf --set-rpath '$ORIGIN/../../lib' {} +";
     runCommand(cmd, code);
 }
 
 static void copyMainAndPatchELF(const DeployPlan& plan) {
-    // Copy main binary into output root
-    fs::path dest = plan.outputRoot / plan.binaryPath.filename();
+    // Copy main binary into output root bin/
+    fs::path dest = plan.outputRoot / "bin" / plan.binaryPath.filename();
     if (!copyFileOverwrite(plan.binaryPath, dest)) {
         std::cerr << "Warning: failed to copy main binary: " << plan.binaryPath << " -> " << dest << "\n";
         return;
     }
-    // Set RUNPATH to $ORIGIN/lib
+    // Set RUNPATH to $ORIGIN/../lib
     int code = 0;
-    std::string cmd = std::string("patchelf --set-rpath '$ORIGIN/lib' ") + shellEscape(dest.string());
+    std::string cmd = std::string("patchelf --set-rpath '$ORIGIN/../lib' ") + shellEscape(dest.string());
     runCommand(cmd, code);
     if (code != 0) {
         std::cerr << "Warning: patchelf failed to set RUNPATH on " << dest << "\n";
@@ -1675,6 +1730,17 @@ int main(int argc, char** argv) {
 
         DeployPlan plan{*maybeType, args.binaryPath, args.outDir, args.qmlRoots, args.languages};
         std::cout << "Detected: " << toString(plan.type) << "\n";
+
+        // Verify external tool availability for this platform
+        {
+            std::vector<std::string> missing = computeMissingTools(plan.type);
+            if (!missing.empty()) {
+                std::cerr << "Missing required external tools for processing this binary:" << "\n";
+                for (const auto& t : missing) std::cerr << "  - " << t << "\n";
+                std::cerr << "Please install them or ensure they are on PATH." << "\n";
+                return 2;
+            }
+        }
 
         ensureOutputLayout(plan);
 

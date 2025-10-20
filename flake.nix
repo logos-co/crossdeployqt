@@ -44,6 +44,7 @@
 
           qt6.qtbase # qtpaths
           qt6.qtdeclarative # qmlimportscanner
+          qt6.qttools # lconvert
 
           llvmPackages.llvm # macOS llvm-otool and llvm-install-name-tool
         ]
