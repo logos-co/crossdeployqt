@@ -79,18 +79,18 @@ in rec {
     };
   };
 
+  # Expose raw global tool for reuse (contains NuGet layout)
+  vpkRaw = pkgs.buildDotnetGlobalTool {
+    pname = "vpk";
+    version = "0.0.1369-g1d5c984";
+    nugetSha256 = "sha256-8XR8AmaDVjmF+/7XtdJiar/xpzrjk+h/7sOavsf0ozQ=";
+    dotnet-runtime = pkgs.dotnetCorePackages.runtime_8_0;
+  };
+
   # Velopack CLI (.NET global tool) wrapped to:
   # - ensure squashfsTools (mksquashfs) is on PATH
   # - unset SOURCE_DATE_EPOCH to avoid conflict with -mkfs-time
-  vpk = let
-    vpkRaw = pkgs.buildDotnetGlobalTool {
-      pname = "vpk";
-      version = "0.0.1369-g1d5c984";
-      nugetSha256 = "sha256-8XR8AmaDVjmF+/7XtdJiar/xpzrjk+h/7sOavsf0ozQ=";
-      # dotnet-sdk = pkgs.dotnetCorePackages.dotnet_8.sdk;
-      dotnet-runtime = pkgs.dotnetCorePackages.runtime_8_0;
-    };
-  in pkgs.stdenvNoCC.mkDerivation {
+  vpk = pkgs.stdenvNoCC.mkDerivation {
     pname = "vpk-wrapped";
     version = "0.0.1369-g1d5c984";
     dontUnpack = true;
@@ -105,6 +105,72 @@ in rec {
     '';
     meta = with lib; {
       description = "Velopack CLI with squashfsTools in PATH and SOURCE_DATE_EPOCH unset";
+      homepage = "https://github.com/velopack/velopack";
+      license = licenses.mit;
+      platforms = platforms.all;
+    };
+  };
+
+  # Velopack CLI (dev) built from Git via buildDotnetModule
+  vpkDev = pkgs.buildDotnetModule rec {
+    pname = "vpk-dev";
+    version = "0.0.0-dev";
+    src = pkgs.fetchFromGitHub {
+      owner = "logos-co";
+      repo = "velopack";
+      rev = "720737d8c2d390e4440d0a7db147fca96e4868f0";
+      hash = "sha256-XMWfj4pC++whqq3ruwID9EUkmvqU80ZzNnWlC8fB/6s=";
+    };
+    projectFile = "src/vpk/Velopack.Vpk/Velopack.Vpk.csproj";
+    # Generate this via: nix build .#vpkDev.fetch-deps && ./result > nix/nuget-deps/vpk-deps.json
+    nugetDeps = ./nuget-deps/vpk-deps.json;
+    dotnet-sdk = pkgs.dotnetCorePackages.combinePackages [
+      pkgs.dotnetCorePackages.sdk_6_0
+      pkgs.dotnetCorePackages.sdk_8_0
+      pkgs.dotnetCorePackages.sdk_9_0
+    ];
+    dotnet-runtime = pkgs.dotnetCorePackages.runtime_8_0;
+    # Build across all required frameworks (referenced projects need net6.0/netstandard2.0)
+    dotnetRestoreFlags = [ ];
+    dotnetBuildFlags = [ "--framework" "net8.0" ];
+    dotnetInstallFlags = [ "--framework" "net8.0" ];
+    doCheck = false;
+    buildType = "Release";
+    # Ensure helper search finds vendor assets and tools available at runtime
+    # - Patch HelperFile.cs to also search $APP_BASE/vendor and VELOPACK_VENDOR_DIR
+    postPatch = ''
+      substituteInPlace src/vpk/Velopack.Packaging/HelperFile.cs \
+        --replace 'AddSearchPath(AppContext.BaseDirectory, "..", "..", "..", "vendor");' $'AddSearchPath(AppContext.BaseDirectory, "..", "..", "..", "vendor");\n        AddSearchPath(System.IO.Path.Combine(AppContext.BaseDirectory, "vendor"));\n        var envVendor = System.Environment.GetEnvironmentVariable("VELOPACK_VENDOR_DIR"); if (!string.IsNullOrEmpty(envVendor)) AddSearchPath(envVendor);'
+    '';
+
+    # Install/wrap all executables produced (vpk)
+    executables = null;
+    postFixup = ''
+      # Provide vendor helpers from the stable vpk NuGet package
+      vendorSrc="${vpkRaw}/share/nuget/packages/vpk/${vpkRaw.version}/vendor"
+      if [ ! -d "$vendorSrc" ]; then
+        vendorSrc="${vpkRaw}/lib/vpk/.store/vpk/${vpkRaw.version}/vpk/${vpkRaw.version}/vendor"
+      fi
+
+      if [ -d "$vendorSrc" ]; then
+        mkdir -p "$out/vendor"
+        cp -R "$vendorSrc"/. "$out/vendor/"
+        # Also place next to AppContext.BaseDirectory (lib/vpk-dev)
+        if [ -d "$out/lib/vpk-dev" ]; then
+          mkdir -p "$out/lib/vpk-dev/vendor"
+          cp -R "$vendorSrc"/. "$out/lib/vpk-dev/vendor/"
+        fi
+      fi
+
+      # Wrap vpk to include squashfs on PATH and point HelperFile to vendor
+      if [ -f "$out/bin/vpk" ]; then
+        wrapProgram "$out/bin/vpk" \
+          --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.squashfsTools ]}" \
+          --set VELOPACK_VENDOR_DIR "$out/vendor"
+      fi
+    '';
+    meta = with lib; {
+      description = "Velopack CLI (dev) built from Git with buildDotnetModule";
       homepage = "https://github.com/velopack/velopack";
       license = licenses.mit;
       platforms = platforms.all;

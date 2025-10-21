@@ -26,6 +26,9 @@
         pkgs = import nixpkgs {
           inherit system;
           config = {
+            permittedInsecurePackages = [
+              "dotnet-sdk-6.0.428" # Needed to generate nuget-deps/vpk-deps.json
+            ];
           };
           overlays = [
           ];
@@ -142,7 +145,7 @@
               };
             };
             crossdeployqt = self.packages.${system}.default;
-            inherit (velopackPkgs) velopack-libc vpk;
+            inherit (velopackPkgs) velopack-libc vpk vpkDev;
             inherit (appimagetoolPkgs) appimagetool appimagetool-full;
           };
 
@@ -150,6 +153,10 @@
           default = {
             type = "app";
             program = "${self.packages.${system}.default}/bin/crossdeployqt";
+          };
+          vpkDev = {
+            type = "app";
+            program = "${self.packages.${system}.vpkDev}/bin/vpk";
           };
         };
 
