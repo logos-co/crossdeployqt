@@ -34,6 +34,9 @@
         lib = pkgs.lib;
         isLinux  = pkgs.stdenv.hostPlatform.isLinux;
 
+        velopackPkgs = import ./nix/velopack.nix { inherit pkgs; };
+        appimagetoolPkgs = import ./nix/appimagetool.nix { inherit pkgs; };
+
         windowsTriple = "x86_64-w64-mingw32";
         mingw = pkgs.pkgsCross.mingwW64;
 
@@ -139,6 +142,8 @@
               };
             };
             crossdeployqt = self.packages.${system}.default;
+            inherit (velopackPkgs) velopack-libc vpk;
+            inherit (appimagetoolPkgs) appimagetool appimagetool-full;
           };
 
         apps = {
