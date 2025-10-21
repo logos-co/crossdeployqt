@@ -202,6 +202,24 @@ static bool isVerbose() {
     return v;
 }
 
+static bool endsWith(const std::string& s, const std::string& suffix) {
+    if (suffix.size() > s.size()) return false;
+    return std::equal(suffix.rbegin(), suffix.rend(), s.rbegin());
+}
+
+static fs::path ensurePlatformOutputRoot(BinaryType type, const fs::path& requestedOutDir, const fs::path& binaryPath) {
+    const std::string req = requestedOutDir.string();
+    const std::string baseName = binaryPath.filename().string();
+    if (type == BinaryType::ELF) {
+        if (endsWith(req, ".AppDir")) return requestedOutDir;
+        return requestedOutDir / (baseName + ".AppDir");
+    } else if (type == BinaryType::MACHO) {
+        if (endsWith(req, ".app")) return requestedOutDir;
+        return requestedOutDir / (baseName + ".app");
+    }
+    return requestedOutDir; // Windows: keep flat dir
+}
+
 // Stubs for later platform-specific actions
 struct DeployPlan {
     BinaryType type;
@@ -857,12 +875,14 @@ static void ensureOutputLayout(const DeployPlan& plan) {
             break;
         }
         case BinaryType::ELF: {
-            fs::create_directories(plan.outputRoot / "bin", ec);
-            fs::create_directories(plan.outputRoot / "plugins", ec);
-            fs::create_directories(plan.outputRoot / "plugins" / "platforms", ec);
-            fs::create_directories(plan.outputRoot / "plugins" / "imageformats", ec);
-            fs::create_directories(plan.outputRoot / "qml", ec);
-            fs::create_directories(plan.outputRoot / "translations", ec);
+            // AppDir structure expected by vpk: usr/bin, usr/lib, usr/plugins, usr/qml, usr/translations
+            fs::create_directories(plan.outputRoot / "usr" / "bin", ec);
+            fs::create_directories(plan.outputRoot / "usr" / "lib", ec);
+            fs::create_directories(plan.outputRoot / "usr" / "plugins", ec);
+            fs::create_directories(plan.outputRoot / "usr" / "plugins" / "platforms", ec);
+            fs::create_directories(plan.outputRoot / "usr" / "plugins" / "imageformats", ec);
+            fs::create_directories(plan.outputRoot / "usr" / "qml", ec);
+            fs::create_directories(plan.outputRoot / "usr" / "translations", ec);
             break;
         }
         case BinaryType::MACHO: {
@@ -977,7 +997,7 @@ static void writeQtConfIfNeeded(const DeployPlan& plan) {
     if (plan.type == BinaryType::MACHO) return;
     fs::path conf;
     if (plan.type == BinaryType::ELF) {
-        conf = plan.outputRoot / "bin" / "qt.conf";
+        conf = plan.outputRoot / "usr" / "bin" / "qt.conf";
     } else {
         conf = plan.outputRoot / "qt.conf";
     }
@@ -985,6 +1005,7 @@ static void writeQtConfIfNeeded(const DeployPlan& plan) {
     if (!ofs) return;
     ofs << "[Paths]\n";
     if (plan.type == BinaryType::ELF) {
+        // Within usr/bin, Qt expects Prefix=.. so that plugins/qml/translations resolve under usr/
         ofs << "Prefix=.." << "\n";
         ofs << "Plugins=../plugins" << "\n";
         ofs << "Qml2Imports=../qml" << "\n";
@@ -1169,7 +1190,7 @@ static void copyPluginsPE(const ResolveContext& ctx, const DeployPlan& plan, con
 }
 
 static void copyResolvedForELF(const DeployPlan& plan, const std::vector<fs::path>& libs) {
-    fs::path libDir = plan.outputRoot / "lib";
+    fs::path libDir = plan.outputRoot / "usr" / "lib";
     std::error_code ec;
     fs::create_directories(libDir, ec);
     for (const auto& lib : libs) {
@@ -1207,22 +1228,22 @@ static void copyPluginsELF(const ResolveContext& ctx, const DeployPlan& plan) {
     const fs::path src = ctx.qt.qtInstallPlugins;
     // platform plugin
     fs::path platformSo = src / "platforms" / "libqxcb.so";
-    if (fs::exists(platformSo)) copyFileOverwrite(platformSo, plan.outputRoot / "plugins" / "platforms" / platformSo.filename());
+    if (fs::exists(platformSo)) copyFileOverwrite(platformSo, plan.outputRoot / "usr" / "plugins" / "platforms" / platformSo.filename());
     // imageformats
     for (const char* name : {"libqjpeg.so","libqico.so","libqgif.so","libqpng.so"}) {
         fs::path p = src / "imageformats" / name;
-        if (fs::exists(p)) copyFileOverwrite(p, plan.outputRoot / "plugins" / "imageformats" / p.filename());
+        if (fs::exists(p)) copyFileOverwrite(p, plan.outputRoot / "usr" / "plugins" / "imageformats" / p.filename());
     }
     // Set RUNPATH on plugins to $ORIGIN/../../lib (plugins/* are typically two levels deep), forcing RPATH
     int code = 0;
-    std::string pluginsDir = (plan.outputRoot / "plugins").string();
+    std::string pluginsDir = (plan.outputRoot / "usr" / "plugins").string();
     std::string cmd = std::string("find ") + shellEscape(pluginsDir) + " -type f -name '*.so*' -exec patchelf --set-rpath '$ORIGIN/../../lib' {} +";
     runCommand(cmd, code);
 }
 
 static void copyMainAndPatchELF(const DeployPlan& plan) {
     // Copy main binary into output root bin/
-    fs::path dest = plan.outputRoot / "bin" / plan.binaryPath.filename();
+    fs::path dest = plan.outputRoot / "usr" / "bin" / plan.binaryPath.filename();
     if (!copyFileOverwrite(plan.binaryPath, dest)) {
         std::cerr << "Warning: failed to copy main binary: " << plan.binaryPath << " -> " << dest << "\n";
         return;
@@ -1419,7 +1440,7 @@ static void copyQmlModules(const ResolveContext& ctx, const DeployPlan& plan) {
     std::error_code ec;
     fs::path qmlDestBase = plan.type == BinaryType::MACHO
         ? plan.outputRoot / "Contents" / "Resources" / "qml"
-        : plan.outputRoot / "qml";
+        : (plan.type == BinaryType::ELF ? plan.outputRoot / "usr" / "qml" : plan.outputRoot / "qml");
     for (const auto& m : modules) {
         if (isVerbose()) std::cout << "[qml] module: " << m.sourcePath << " -> " << (qmlDestBase / m.relativePath) << "\n";
         fs::path dst = qmlDestBase / m.relativePath;
@@ -1493,7 +1514,7 @@ static std::vector<fs::path> listQmlPluginLibraries(const DeployPlan& plan) {
     std::error_code ec;
     fs::path qmlBase = plan.type == BinaryType::MACHO
         ? plan.outputRoot / "Contents" / "Resources" / "qml"
-        : plan.outputRoot / "qml";
+        : (plan.type == BinaryType::ELF ? plan.outputRoot / "usr" / "qml" : plan.outputRoot / "qml");
     if (!fs::exists(qmlBase, ec)) return libs;
     std::string ext = plan.type == BinaryType::PE ? ".dll" : (plan.type == BinaryType::ELF ? ".so" : ".dylib");
     std::unordered_set<std::string> seen;
@@ -1804,6 +1825,7 @@ static std::vector<std::string> computeLanguages(const DeployPlan& plan) {
 
 static fs::path translationsOutputDir(const DeployPlan& plan) {
     if (plan.type == BinaryType::MACHO) return plan.outputRoot / "Contents" / "Resources" / "translations";
+    if (plan.type == BinaryType::ELF) return plan.outputRoot / "usr" / "translations";
     return plan.outputRoot / "translations";
 }
 
@@ -1967,7 +1989,8 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        DeployPlan plan{*maybeType, args.binaryPath, args.outDir, args.qmlRoots, args.languages, args.overlays};
+        fs::path normalizedOut = ensurePlatformOutputRoot(*maybeType, args.outDir, args.binaryPath);
+        DeployPlan plan{*maybeType, args.binaryPath, normalizedOut, args.qmlRoots, args.languages, args.overlays};
         std::cout << "Detected: " << toString(plan.type) << "\n";
 
         // Verify external tool availability for this platform

@@ -79,12 +79,35 @@ in rec {
     };
   };
 
-  # Velopack CLI (.NET global tool)
-  vpk = pkgs.buildDotnetGlobalTool {
-    pname = "vpk";
+  # Velopack CLI (.NET global tool) wrapped to:
+  # - ensure squashfsTools (mksquashfs) is on PATH
+  # - unset SOURCE_DATE_EPOCH to avoid conflict with -mkfs-time
+  vpk = let
+    vpkRaw = pkgs.buildDotnetGlobalTool {
+      pname = "vpk";
+      version = "0.0.1369-g1d5c984";
+      nugetSha256 = "sha256-8XR8AmaDVjmF+/7XtdJiar/xpzrjk+h/7sOavsf0ozQ=";
+      # dotnet-sdk = pkgs.dotnetCorePackages.dotnet_8.sdk;
+      dotnet-runtime = pkgs.dotnetCorePackages.runtime_8_0;
+    };
+  in pkgs.stdenvNoCC.mkDerivation {
+    pname = "vpk-wrapped";
     version = "0.0.1369-g1d5c984";
-    nugetSha256 = "sha256-8XR8AmaDVjmF+/7XtdJiar/xpzrjk+h/7sOavsf0ozQ=";
-    # dotnet-sdk = pkgs.dotnetCorePackages.dotnet_8.sdk;
-    dotnet-runtime = pkgs.dotnetCorePackages.runtime_8_0;
+    dontUnpack = true;
+    nativeBuildInputs = [ pkgs.makeWrapper ];
+    installPhase = ''
+      runHook preInstall
+      mkdir -p "$out/bin"
+      makeWrapper "${vpkRaw}/bin/vpk" "$out/bin/vpk" \
+        --unset SOURCE_DATE_EPOCH \
+        --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.squashfsTools ]}"
+      runHook postInstall
+    '';
+    meta = with lib; {
+      description = "Velopack CLI with squashfsTools in PATH and SOURCE_DATE_EPOCH unset";
+      homepage = "https://github.com/velopack/velopack";
+      license = licenses.mit;
+      platforms = platforms.all;
+    };
   };
 }

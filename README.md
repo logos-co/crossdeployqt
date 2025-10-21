@@ -42,6 +42,69 @@ or
     };
 }
 ```
+## Packaging
+
+Velopack can be used for packaging & code-signing on multiple platforms, requires no `appimagetool` and does not require using their updater functionality using `--skipVeloAppCheck`.
+
+
+### Windows
+
+Velopack signs every PE binary it finds under `--packDir` — i.e., .exe and .dll — recursively by default. You can switch to "EXE‑only" with `--signSkipDll`, and you can exclude files with a regex via 
+`--signExclude "\.(resources|dbg)\.dll$"`.
+
+You may want to look into `--signParams ...`, `--azureTrustedSignFile`, `--signParallel` as needed.
+
+```powershell
+vpk pack ^
+  --packId com.example.myapp ^
+  --packVersion 1.0.0 ^
+  --packDir dist\win-x64 ^
+  --mainExe MyApp.exe ^
+  --packTitle "My App" ^
+  --icon build\myapp.ico ^
+  --delta none ^
+  --noPortable ^
+  --signParams "/a /fd sha256 /tr http://timestamp.digicert.com /td sha256" ^
+  --skipVeloAppCheck
+```
+
+### macOS
+
+By default Velopack codesigns the entire .app bundle ("deep signing") and then notarizes, which covers frameworks/dylibs. With `--signDisableDeep` Velopack expects the bundle to be pre‑signed.
+
+Notarisation requires `notarytool` on your PATH.
+
+`--signAppIdentity`, `--signInstallIdentity`, `--notaryProfile`
+
+```bash
+vpk pack \
+  --packId com.example.myapp \
+  --packVersion 1.0.0 \
+  --packDir dist/MyApp.app \
+  --mainExe MyApp \
+  --packTitle "My App" \
+  --icon build/myapp.icns \
+  --delta none \
+  --noPortable \
+  --signAppIdentity "Developer ID Application: Your Company (TEAMID)" \
+  --signInstallIdentity "Developer ID Installer: Your Company (TEAMID)" \
+  --notaryProfile "MyNotaryProfile"
+```
+
+### Linux AppImage
+
+For Linux, there isn't an OS‑level code‑signing pass for ELF binaries
+
+```bash
+vpk pack \
+  --packId com.example.myapp \
+  --packVersion 1.0.0 \
+  --packDir dist/linux-x64 \
+  --mainExe myapp \
+  --packTitle "My App"
+```
+
+## Notes
 
 Missing features:
 - [ ] Automatic translation file handling
