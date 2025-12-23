@@ -26,9 +26,6 @@
         pkgs = import nixpkgs {
           inherit system;
           config = {
-            permittedInsecurePackages = [
-              "dotnet-sdk-6.0.428" # Needed to generate nuget-deps/vpk-deps.json
-            ];
           };
           overlays = [
           ];
@@ -36,9 +33,6 @@
 
         lib = pkgs.lib;
         isLinux  = pkgs.stdenv.hostPlatform.isLinux;
-
-        velopackPkgs = import ./nix/velopack.nix { inherit pkgs; };
-        appimagetoolPkgs = import ./nix/appimagetool.nix { inherit pkgs; };
 
         windowsTriple = "x86_64-w64-mingw32";
         mingw = pkgs.pkgsCross.mingwW64;
@@ -51,6 +45,8 @@
           qt6.qtbase # qtpaths
           qt6.qtdeclarative # qmlimportscanner
           qt6.qttools # lconvert
+
+          nsis
 
           llvmPackages.llvm # macOS llvm-otool and llvm-install-name-tool
         ]
@@ -145,18 +141,12 @@
               };
             };
             crossdeployqt = self.packages.${system}.default;
-            inherit (velopackPkgs) velopack-libc vpk vpkDev;
-            inherit (appimagetoolPkgs) appimagetool appimagetool-full;
           };
 
         apps = {
           default = {
             type = "app";
             program = "${self.packages.${system}.default}/bin/crossdeployqt";
-          };
-          vpkDev = {
-            type = "app";
-            program = "${self.packages.${system}.vpkDev}/bin/vpk";
           };
         };
 

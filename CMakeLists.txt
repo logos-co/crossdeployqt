@@ -8,6 +8,21 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(crossdeployqt
   src/main.cpp
+  src/cdqt/args.cpp
+  src/cdqt/binary_detect.cpp
+  src/cdqt/common.cpp
+  src/cdqt/util.cpp
+  src/cdqt/tools.cpp
+  src/cdqt/qt_paths.cpp
+  src/cdqt/deps_parse.cpp
+  src/cdqt/resolve.cpp
+  src/cdqt/fs_ops.cpp
+  src/cdqt/pe_patch.cpp
+  src/cdqt/stage.cpp
+  src/cdqt/qml.cpp
+  src/cdqt/translations.cpp
+  src/cdqt/macho_fixups.cpp
+  src/cdqt/deploy.cpp
 )
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")

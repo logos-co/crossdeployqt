@@ -6,8 +6,6 @@ It supports Linux, macOS & Windows(MingW) binaries, and can be viewed as an alte
 
 Crossdeployqt is used on a Linux host, and can deploy for Linux & Windows(MingW). It could technically deploy macOS on a Linux host if you have the SDK & Qt frameworks, in our usage we use a macOS host.
 
-Code signing, packaging & installers for distribution is out of scope, use dedicated packaging tools i.e [Velopack](https://velopack.io). For convienience, `vpk` and `velopack-libc` with MingW bindings, as well as `appimagetool` and its type2 runtimes via `appimagetool-full` are provided by the Nix derivation.
-
 
 ## Usage 
 
